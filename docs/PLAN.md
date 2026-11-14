@@ -3,7 +3,9 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0 done** (toolchain and skeleton). Next up is M1.
+Status: **M0 done. M1 implemented**: shm and dmabuf clients connect and are
+shown (checked by `--smoke`), but typing and clicking still need a hands-on
+check. Next up is M2.
 
 ## Decisions
 

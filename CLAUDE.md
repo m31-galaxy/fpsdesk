@@ -14,11 +14,23 @@ nix develop -c cargo build
 nix develop -c cargo test
 nix develop -c cargo clippy --all-targets -- -D warnings
 nix develop -c cargo fmt
-nix develop -c cargo run -- --smoke   # opens a window for under a second, exits 0
+nix develop -c cargo run -- --smoke -c foot   # self-test, see below
 ```
 
+`--smoke` opens the nested window for under a second and exits 0 after 60
+frames; with `-c <client>` the frames only count once that client has a window
+up, and it exits 1 after 10 s otherwise. It proves a client connected and
+attached a buffer, not that pixels are right or that input works: there is no
+way to inject input or capture the window from here, so ask the user to check
+those by hand.
+
 New files must be `git add`ed before Nix can see them. The dev shell provides
-`foot`, `weston-terminal` and `wayland-info` as test clients.
+`foot`, `weston-terminal`, `es2gears_wayland` (a GPU/dmabuf client) and
+`wayland-info` as test clients.
+
+## Commits
+
+Do not add Claude co-author or attribution trailers to commit messages.
 
 ## Conventions
 

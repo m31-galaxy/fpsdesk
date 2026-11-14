@@ -1,85 +1,123 @@
-//! FPSDesk entry point.
+//! FPSDesk: a Wayland compositor navigable in first-person 3D.
 //!
-//! For now this is only a toolchain smoke test: it opens a nested window on the
-//! host compositor through Smithay's winit backend, reports which GL driver it
-//! got, and clears the window every frame. See `docs/PLAN.md` for what replaces it.
+//! See `docs/PLAN.md` for the design. At this stage (M1) it is an ordinary flat
+//! compositor running nested in a window.
 
-use std::ffi::{CStr, c_char};
+mod backend;
+mod handlers;
+mod input;
+mod state;
+
+use std::{error::Error, process::Command, time::Duration};
 
 use smithay::{
-    backend::{
-        renderer::{
-            Color32F, Frame, Renderer,
-            gles::{GlesRenderer, ffi},
+    backend::renderer::gles::GlesRenderer,
+    reexports::{
+        calloop::{
+            EventLoop,
+            timer::{TimeoutAction, Timer},
         },
-        winit::{self, WinitEvent},
+        wayland_server::Display,
     },
-    reexports::calloop::EventLoop,
-    utils::{Rectangle, Transform},
 };
-use tracing::info;
+use tracing::{error, info, warn};
 
-/// Frames to draw before exiting when run with `--smoke`.
-const SMOKE_FRAMES: u32 = 60;
+use crate::state::{Smoke, State};
 
-const CLEAR_COLOR: Color32F = Color32F::new(0.05, 0.07, 0.12, 1.0);
+const USAGE: &str = "\
+Usage: fpsdesk [OPTIONS]
 
-struct State {
-    running: bool,
+Options:
+  -c, --command <CMD>  Run CMD (through sh) as a client once started; repeatable
+      --smoke          Self-test: exit 0 after 60 frames, or exit 1 after 10 s.
+                       With -c, frames only count once a client window is shown
+  -h, --help           Show this help";
+
+/// How long a `--smoke` run may take before it counts as failed.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct Args {
+    smoke: bool,
+    commands: Vec<String>,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn parse_args() -> Result<Args, String> {
+    let mut parsed = Args {
+        smoke: false,
+        commands: Vec::new(),
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--smoke" => parsed.smoke = true,
+            "-c" | "--command" => {
+                let command = args.next().ok_or(format!("{arg} needs a command"))?;
+                parsed.commands.push(command);
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(parsed)
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args = parse_args().map_err(|err| format!("{err}\n\n{USAGE}"))?;
     init_logging();
 
-    let smoke = std::env::args().skip(1).any(|arg| arg == "--smoke");
-
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
-    let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    let display: Display<State> = Display::new()?;
 
-    let (version, renderer_name) = backend.renderer().with_context(|gl| unsafe {
-        (gl_string(gl, ffi::VERSION), gl_string(gl, ffi::RENDERER))
-    })?;
-    info!(%version, renderer = %renderer_name, "nested backend ready");
+    let (backend, winit) = smithay::backend::winit::init::<GlesRenderer>()?;
+    let mut state = State::new(&mut event_loop, display, backend)?;
+    backend::winit::init(&mut event_loop, &mut state, winit)?;
 
-    let mut frames: u32 = 0;
-    event_loop
-        .handle()
-        .insert_source(winit, move |event, _, state| match event {
-            WinitEvent::Redraw => {
-                let size = backend.window_size();
-                let damage = Rectangle::from_size(size);
-                {
-                    let (renderer, mut framebuffer) = backend.bind().expect("bind window surface");
-                    let mut frame = renderer
-                        .render(&mut framebuffer, size, Transform::Flipped180)
-                        .expect("begin frame");
-                    frame.clear(CLEAR_COLOR, &[damage]).expect("clear");
-                    // The sync point only matters when another context reads this
-                    // target; swapping the window surface below flushes on its own.
-                    let _sync = frame.finish().expect("finish frame");
-                }
-                backend.submit(Some(&[damage])).expect("swap buffers");
+    info!(socket = ?state.socket_name, "listening for Wayland clients");
 
-                frames += 1;
-                if smoke && frames >= SMOKE_FRAMES {
-                    info!(frames, "smoke test passed");
-                    state.running = false;
-                }
-                backend.window().request_redraw();
-            }
-            WinitEvent::CloseRequested => state.running = false,
-            _ => {}
-        })?;
+    if args.smoke {
+        state.smoke = Some(Smoke {
+            needs_window: !args.commands.is_empty(),
+            frames: 0,
+            passed: false,
+        });
+        event_loop
+            .handle()
+            .insert_source(Timer::from_duration(SMOKE_TIMEOUT), |_, _, state| {
+                error!("smoke test timed out");
+                state.loop_signal.stop();
+                TimeoutAction::Drop
+            })?;
+    }
 
-    let mut state = State { running: true };
-    let signal = event_loop.get_signal();
-    event_loop.run(None, &mut state, move |state| {
-        if !state.running {
-            signal.stop();
-        }
-    })?;
+    for command in &args.commands {
+        spawn_client(command, &state);
+    }
 
-    Ok(())
+    event_loop.run(None, &mut state, |_| {})?;
+
+    match state.smoke {
+        Some(Smoke { passed: false, .. }) => Err("smoke test failed".into()),
+        _ => Ok(()),
+    }
+}
+
+/// Start a client program connected to our Wayland socket.
+fn spawn_client(command: &str, state: &State) {
+    let result = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .env("WAYLAND_DISPLAY", &state.socket_name)
+        // Without this, toolkits can quietly fall back to the host's X server
+        // and open their window outside FPSDesk.
+        .env_remove("DISPLAY")
+        .spawn();
+    match result {
+        Ok(child) => info!(command, pid = child.id(), "spawned client"),
+        Err(err) => warn!(command, %err, "failed to spawn client"),
+    }
 }
 
 fn init_logging() {
@@ -88,18 +126,4 @@ fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,smithay=warn"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
-}
-
-/// Read one of the `glGetString` values from the current context.
-///
-/// # Safety
-/// A GL context must be current on this thread.
-unsafe fn gl_string(gl: &ffi::Gles2, name: ffi::types::GLenum) -> String {
-    let ptr = unsafe { gl.GetString(name) } as *const c_char;
-    if ptr.is_null() {
-        return String::from("<unknown>");
-    }
-    unsafe { CStr::from_ptr(ptr) }
-        .to_string_lossy()
-        .into_owned()
 }

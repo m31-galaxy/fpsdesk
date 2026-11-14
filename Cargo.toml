@@ -18,6 +18,7 @@ git = "https://github.com/Smithay/smithay"
 rev = "fd8e3f50f9556aa6c0485989d1d49ff2c5eefae1"
 default-features = false
 features = [
+    "backend_drm",
     "backend_winit",
     "desktop",
     "renderer_gl",
