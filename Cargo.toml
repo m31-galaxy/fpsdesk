@@ -1,0 +1,32 @@
+[package]
+name = "fpsdesk"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A Wayland compositor navigable in first-person 3D"
+publish = false
+
+[dependencies]
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Smithay's last crates.io release (0.7.0, mid-2025) is far behind master, so we
+# pin a git revision instead, as niri and cosmic-comp do. Bump it deliberately:
+# master has no API stability guarantees.
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay"
+rev = "fd8e3f50f9556aa6c0485989d1d49ff2c5eefae1"
+default-features = false
+features = [
+    "backend_winit",
+    "desktop",
+    "renderer_gl",
+    "wayland_frontend",
+]
+
+[profile.dev]
+# Smithay's renderer and protocol code is unusably slow unoptimised.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
