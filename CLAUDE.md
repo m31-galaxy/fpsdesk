@@ -41,6 +41,8 @@ nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
   To click a widget, take a screenshot first and read its position off it:
   `move X Y` takes output pixels, which are screenshot pixels under
   `headless-run`.
+- `--smoke-frames N` changes how many frames pass between the end of the
+  script and the screenshot (default 60), to catch a short animation.
 - `--camera X,Z,YAW,PITCH` (metres and degrees) starts the view somewhere else,
   for screenshots of a particular angle.
 - `scripts/headless-run` uses a headless Weston as the host session. Always use
@@ -57,6 +59,11 @@ behind input (camera, picking, movement keys, modes) in the pure `world/` and
 What a script cannot reach is the nested backend's handling of the host's
 pointer (locking, hiding, relative motion): headless Weston has no pointer.
 Changes there need the user to try them on their desktop; say so plainly.
+
+The TTY backend (`--backend tty`) cannot be run from inside a desktop session
+either. Never start it from here. Changes to `backend/tty.rs` can only be
+compiled and reviewed; the user has to run them on a virtual console, starting
+with a `--smoke --screenshot` run, which exits by itself.
 
 Smithay logs `surface missing from known popups` at error level when a GTK
 menu is dismissed. It comes from Smithay's own commit hook and is harmless.

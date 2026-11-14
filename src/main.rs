@@ -47,6 +47,9 @@ Options:
       --smoke-frames <N>   With --smoke: frames to render after the script ends
                            before passing and taking the screenshot (default 60)
       --screenshot <PATH>  With --smoke: save the last frame to PATH as a PNG
+      --exit-after <SECS>  Quit after SECS seconds whatever happens. A safety net
+                           for trying the tty backend: it gets you back to the
+                           console even if the keyboard does not respond
       --script <STEPS>     Play scripted input, one step a frame; see src/script.rs
       --camera <X,Z,YAW,PITCH>
                            Start X metres right of and Z metres behind the origin,
@@ -85,6 +88,7 @@ struct Args {
     scale: f64,
     smoke: bool,
     smoke_frames: u32,
+    exit_after: Option<u64>,
     screenshot: Option<PathBuf>,
     camera: Option<[f32; 4]>,
     script: Option<String>,
@@ -97,6 +101,7 @@ fn parse_args() -> Result<Args, String> {
         scale: 1.0,
         smoke: false,
         smoke_frames: SMOKE_FRAMES,
+        exit_after: None,
         screenshot: None,
         camera: None,
         script: None,
@@ -118,6 +123,10 @@ fn parse_args() -> Result<Args, String> {
                 parsed.scale = scale
                     .filter(|scale| *scale > 0.0)
                     .ok_or("--scale needs a positive number")?;
+            }
+            "--exit-after" => {
+                let seconds = args.next().and_then(|n| n.parse().ok());
+                parsed.exit_after = Some(seconds.ok_or("--exit-after needs a number of seconds")?);
             }
             "--smoke-frames" => {
                 let frames = args.next().and_then(|n| n.parse().ok());
@@ -211,6 +220,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             .handle()
             .insert_source(Timer::from_duration(SMOKE_TIMEOUT), |_, _, state| {
                 error!("smoke test timed out");
+                state.loop_signal.stop();
+                TimeoutAction::Drop
+            })?;
+    }
+
+    if let Some(seconds) = args.exit_after {
+        let timer = Timer::from_duration(Duration::from_secs(seconds));
+        event_loop
+            .handle()
+            .insert_source(timer, move |_, _, state| {
+                info!(seconds, "--exit-after: time is up, quitting");
                 state.loop_signal.stop();
                 TimeoutAction::Drop
             })?;

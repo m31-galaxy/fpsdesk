@@ -3,12 +3,12 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0 to M3 done. M4 implemented**: clicking, dragging, scrolling,
-typing, menus and client cursors are checked by scripted input and
-screenshots. What is left to confirm by hand is the nested window's handling
-of the host's own pointer when switching modes. **The TTY backend of M6 is
-written but has never been run on a real console** (see M6); a login-session
-entry and NixOS module are still to do. Next up is M5.
+Status: **M0 to M4 done**, plus three things built out of order: a text
+launcher (backtick in walk mode), closing windows by shooting them (right
+click, three hits), and **the TTY backend of M6, which is written but has
+never been run on a real console** (see M6). A login-session entry and NixOS
+module are still to do. The rest of M5 (placing, moving and resizing windows)
+is next.
 
 ## Decisions
 
@@ -75,6 +75,9 @@ src/
   frame.rs      the per-frame work both backends share
   input/        mode state machine, key bindings, pointer routing
   script.rs     scripted input for automated checks (--script)
+  frame.rs      the per-frame work shared by both backends
+  prompt.rs     the launcher prompt; text.rs rasterises its bitmap font
+  shooting.rs   shooting windows; the simulation is world/combat.rs
   world/        camera, panels, ray picking, placement. No GL, no Smithay types.
   render/       all raw GL: world framebuffer, shaders, window textures
 ```

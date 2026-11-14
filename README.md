@@ -33,6 +33,9 @@ and `XDG_RUNTIME_DIR` set, which a normal login provides.
 nix develop -c cargo build
 # A first check: draws for about a second, saves a picture, and exits by itself.
 nix develop -c ./target/debug/fpsdesk --backend tty --smoke --screenshot /tmp/fpsdesk.png 2> /tmp/fpsdesk.log
+# A first interactive try that quits by itself after 30 seconds, in case the
+# keyboard does not respond:
+nix develop -c ./target/debug/fpsdesk --backend tty --exit-after 30 -c foot 2> /tmp/fpsdesk.log
 # The real thing:
 nix develop -c ./target/debug/fpsdesk --backend tty -c foot 2> /tmp/fpsdesk.log
 ```
