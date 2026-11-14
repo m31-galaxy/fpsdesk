@@ -3,9 +3,11 @@
 A Wayland compositor whose desktop is a 3D space you walk through in first
 person. Early days: see [docs/PLAN.md](docs/PLAN.md) for the design and roadmap.
 
-Right now it runs as a window inside your existing session. Application windows
-stand on panels in an open space that you can walk around. Walk up to one, click
-it, and use it with the keyboard and mouse as usual.
+It runs either as a window inside your existing session or, started from a
+virtual console, as a session of its own (the TTY backend, new and not yet
+tried on real hardware). Application windows stand on panels in an open space
+that you can walk around. Walk up to one, click it, and use it with the
+keyboard and mouse as usual.
 
 ## Building and running
 
@@ -20,6 +22,34 @@ cargo test
 
 Programs started with `-c` connect to FPSDesk; to start one by hand, set
 `WAYLAND_DISPLAY` to the socket name FPSDesk logs at startup.
+
+## Starting from a TTY
+
+Switch to a virtual console (Ctrl+Alt+F3, say), log in, and run it there, with
+no desktop running on that console. It needs a seat manager (seatd or logind)
+and `XDG_RUNTIME_DIR` set, which a normal login provides.
+
+```sh
+nix develop -c cargo build
+# A first check: draws for about a second, saves a picture, and exits by itself.
+nix develop -c ./target/debug/fpsdesk --backend tty --smoke --screenshot /tmp/fpsdesk.png 2> /tmp/fpsdesk.log
+# The real thing:
+nix develop -c ./target/debug/fpsdesk --backend tty -c foot 2> /tmp/fpsdesk.log
+```
+
+`--backend` defaults to `nested` when `WAYLAND_DISPLAY` or `DISPLAY` is set and
+to `tty` otherwise. Logs go to stderr, so redirect them as above. `--scale 2`
+doubles the size of everything on a HiDPI panel. FPSDesk drives one monitor, the
+internal panel if there is one, and ignores any others.
+
+| | |
+| --- | --- |
+| **Ctrl+Alt+F1** to **F12** | Switch to that virtual console (works in both modes) |
+| **Ctrl+Alt+Backspace** | Quit FPSDesk (works in both modes) |
+
+Switching away and back pauses and restores FPSDesk. With no host cursor, a
+built-in arrow is drawn in interact mode, and tap-to-click is turned on for
+touchpads.
 
 ## Controls
 

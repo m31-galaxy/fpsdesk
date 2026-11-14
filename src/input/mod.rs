@@ -12,11 +12,14 @@
 //!   walk mode.
 //! - Either mode: Super, or Ctrl+Escape, switches to the other mode. (Under a
 //!   host desktop Super usually never reaches us, hence the second binding.)
+//! - Either mode, on a TTY: Ctrl+Alt+F1..F12 switches virtual console and
+//!   Ctrl+Alt+Backspace quits (`emergency.rs`, checked before anything else).
 //!
 //! The handlers take plain values rather than backend events so that scripted
 //! input (`script.rs`) can drive them exactly as a real device would.
 
 pub mod controls;
+pub mod emergency;
 
 use glam::Vec2;
 use smithay::{
@@ -40,6 +43,7 @@ use crate::{
     world::{self, Ray},
 };
 use controls::{Mode, key, look_delta};
+use emergency::Emergency;
 
 /// The left mouse button's evdev code.
 pub const BTN_LEFT: u32 = 0x110;
@@ -50,6 +54,8 @@ const WHEEL_NOTCH_PIXELS: f64 = 15.0;
 /// What a key press that we kept for ourselves asks for.
 enum KeyAction {
     ToggleMode,
+    /// One of the bindings in `emergency.rs`.
+    Emergency(Emergency),
     /// A key that means something in walk mode, or nothing at all.
     Walk,
 }
@@ -79,7 +85,8 @@ impl State {
                 self.key(event.key_code(), event.state(), event.time());
             }
             InputEvent::PointerMotion { event, .. } => {
-                self.look(Vec2::new(event.delta_x() as f32, event.delta_y() as f32));
+                let delta = Vec2::new(event.delta_x() as f32, event.delta_y() as f32);
+                self.pointer_moved_by(delta, event.time());
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 if let Some(size) = self.view_size() {
@@ -141,6 +148,12 @@ impl State {
             SERIAL_COUNTER.next_serial(),
             time,
             |state, modifiers, handle| {
+                // Before anything else, so that nothing can stand in their way.
+                if pressed && let Some(action) = emergency::detect(handle.modified_sym(), modifiers)
+                {
+                    state.suppressed_keys.insert(keycode.raw());
+                    return FilterResult::Intercept(KeyAction::Emergency(action));
+                }
                 if !pressed {
                     // The release of a key whose press we kept must not reach
                     // a client that never saw the press.
@@ -169,6 +182,7 @@ impl State {
 
         match action {
             Some(KeyAction::ToggleMode) => self.toggle_mode(),
+            Some(KeyAction::Emergency(action)) => self.emergency(action),
             Some(KeyAction::Walk) => {
                 // Releases always count, so a key held while leaving walk mode
                 // does not stay held.
@@ -180,6 +194,20 @@ impl State {
                 }
             }
             None => {}
+        }
+    }
+
+    /// The pointer moved by `delta` device units, from a relative device such
+    /// as a mouse or touchpad. Turns the view while walking; moves the cursor
+    /// in interact mode, where nothing else would, as there is no host cursor.
+    pub fn pointer_moved_by(&mut self, delta: Vec2, time: InputTime) {
+        match self.mode {
+            Mode::Walk => self.look(delta),
+            Mode::Interact => {
+                if let Some(size) = self.view_size() {
+                    self.pointer_moved_to((self.cursor + delta).clamp(Vec2::ZERO, size), time);
+                }
+            }
         }
     }
 

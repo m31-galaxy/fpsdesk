@@ -3,16 +3,11 @@
 //! The window is our one output, the host's input events are our input
 //! devices, and the host's frame pacing drives our redraws.
 
-use std::{
-    error::Error,
-    mem::ManuallyDrop,
-    time::{Duration, Instant},
-};
+use std::{error::Error, mem::ManuallyDrop};
 
 use glam::Vec2;
 use smithay::{
     backend::winit::{WinitEvent, WinitEventLoop},
-    desktop::utils::send_frames_surface_tree,
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::EventLoop,
@@ -24,9 +19,7 @@ use tracing::{error, info, warn};
 
 use super::relative_pointer::RelativePointer;
 use crate::{
-    frame_stats::FrameStats,
-    input::controls::Mode as ControlMode,
-    render::{self, CursorSprite, Overlays, Presenter, screenshot},
+    frame::{self, Frame, FrameParams},
     state::State,
 };
 
@@ -37,16 +30,10 @@ const REFRESH_MHZ: i32 = 60_000;
 /// upside down relative to how the output is described to clients.
 const OUTPUT_TRANSFORM: Transform = Transform::Flipped180;
 
-/// The longest step the world takes in one frame. After a stall (the window
-/// was hidden, say) this stops a held key from teleporting the viewer.
-const MAX_FRAME_STEP: Duration = Duration::from_millis(100);
-
 /// What the nested backend keeps between frames.
 struct Nested {
     output: Output,
-    presenter: Presenter,
-    stats: FrameStats,
-    last_frame: Instant,
+    frame: Frame,
     /// Relative motion from the host, if it offers it. Never dropped: see
     /// `RelativePointer::new`.
     relative_pointer: Option<ManuallyDrop<RelativePointer>>,
@@ -64,6 +51,7 @@ pub fn init(
 ) -> Result<(), Box<dyn Error>> {
     state
         .backend
+        .winit()
         .window()
         .set_title("FPSDesk (Ctrl+Esc releases the mouse)");
 
@@ -80,11 +68,11 @@ pub fn init(
     let _global = output.create_global::<State>(&state.display_handle);
 
     let mode = Mode {
-        size: state.backend.window_size(),
+        size: state.backend.winit().window_size(),
         refresh: REFRESH_MHZ,
     };
     // Matching the host's scale keeps clients sharp on a HiDPI display.
-    let scale = Scale::Fractional(state.backend.window().scale_factor());
+    let scale = Scale::Fractional(state.backend.winit().window().scale_factor());
     output.change_current_state(
         Some(mode),
         Some(OUTPUT_TRANSFORM),
@@ -96,7 +84,7 @@ pub fn init(
 
     // Safety: wrapped in `ManuallyDrop` below and so never dropped, while the
     // winit event loop lives in the calloop loop until the process exits.
-    let relative_pointer = match unsafe { RelativePointer::new(state.backend.window()) } {
+    let relative_pointer = match unsafe { RelativePointer::new(state.backend.winit().window()) } {
         Ok(relative_pointer) => {
             info!("mouselook uses the host's relative pointer motion");
             Some(ManuallyDrop::new(relative_pointer))
@@ -110,9 +98,7 @@ pub fn init(
 
     let mut nested = Nested {
         output,
-        presenter: Presenter::new(),
-        stats: FrameStats::new(),
-        last_frame: Instant::now(),
+        frame: Frame::new(),
         relative_pointer,
         pointer_captured: false,
         host_cursor_visible: true,
@@ -153,87 +139,42 @@ pub fn init(
 }
 
 fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> {
-    let frame_start = Instant::now();
-    let dt = frame_start
-        .duration_since(nested.last_frame)
-        .min(MAX_FRAME_STEP);
-    nested.last_frame = frame_start;
+    let start = nested.frame.begin();
+    let params = FrameParams {
+        size: state.backend.winit().window_size(),
+        scale: nested.output.current_scale().fractional_scale(),
+        transform: OUTPUT_TRANSFORM,
+        // The host shows its own cursor.
+        builtin_cursor: false,
+    };
 
-    let size = state.backend.window_size();
-    let scale = nested.output.current_scale().fractional_scale();
-
-    state.run_script_step();
-    sync_host_pointer(state, nested);
-    if let Some(relative_pointer) = nested.relative_pointer.as_mut() {
-        // Taken every frame, used or not, so that motion made in interact
-        // mode does not pile up and swing the view on return to walking.
-        let (dx, dy) = relative_pointer.take_motion();
-        state.look(Vec2::new(dx as f32, dy as f32));
-    }
-    state.advance(dt.as_secs_f32());
-
-    let world = render::render_world(
-        state.backend.renderer(),
-        &mut state.scene,
-        &mut state.windows,
-        &state.camera,
-        size,
-        scale,
-    )?;
-
-    let smoke_finished = state.smoke_frame_rendered();
-    {
-        // Cloned so that it does not hold a borrow of `state` across `bind`.
-        let cursor_surface = state.cursor_surface().cloned();
-        let overlays = Overlays {
-            crosshair: state.mode == ControlMode::Walk,
-            cursor: cursor_surface.as_ref().map(|surface| CursorSprite {
-                surface,
-                position: <(i32, i32)>::from((state.cursor.as_dvec2() * scale).round().as_ivec2())
-                    .into(),
-                scale,
-            }),
-        };
-        let (renderer, mut framebuffer) = state.backend.bind()?;
-        nested.presenter.present(
-            renderer,
-            &mut framebuffer,
-            size,
-            OUTPUT_TRANSFORM,
-            world,
-            overlays,
-        )?;
-
-        let screenshot = state.smoke.as_ref().and_then(|s| s.screenshot.as_deref());
-        if smoke_finished && let Some(path) = screenshot {
-            screenshot::save(renderer, &mut framebuffer, size, path)?;
-            info!(?path, "saved screenshot");
+    let prepared = frame::prepare(state, &start, params, |state| {
+        sync_host_pointer(state, nested);
+        if let Some(relative_pointer) = nested.relative_pointer.as_mut() {
+            // Taken every frame, used or not, so that motion made in interact
+            // mode does not pile up and swing the view on return to walking.
+            let (dx, dy) = relative_pointer.take_motion();
+            state.look(Vec2::new(dx as f32, dy as f32));
         }
-    }
-    state.backend.submit(Some(&[Rectangle::from_size(size)]))?;
+    })?;
 
-    // Tell clients the frame is on screen so they draw their next one.
-    let elapsed = state.start_time.elapsed();
-    for entry in &state.windows {
-        entry
-            .window
-            .send_frame(&nested.output, elapsed, Some(Duration::ZERO), |_, _| {
-                Some(nested.output.clone())
-            });
+    {
+        let (renderer, mut framebuffer) = state.backend.winit().bind()?;
+        // The window surface is swapped, which waits for the drawing itself.
+        let _sync = nested
+            .frame
+            .present(&prepared, renderer, &mut framebuffer)?;
     }
+    state
+        .backend
+        .winit()
+        .submit(Some(&[Rectangle::from_size(params.size)]))?;
 
-    if let Some(surface) = state.cursor_surface() {
-        send_frames_surface_tree(surface, &nested.output, elapsed, None, |_, _| {
-            Some(nested.output.clone())
-        });
-    }
-
-    state.refresh();
-    state.display_handle.flush_clients()?;
-    nested.stats.frame(frame_start.elapsed());
+    frame::finish(state, &nested.output)?;
+    nested.frame.record(&start);
 
     // Redraw continuously; the host throttles us to its refresh rate.
-    state.backend.window().request_redraw();
+    state.backend.winit().window().request_redraw();
     Ok(())
 }
 
@@ -242,8 +183,8 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
 fn sync_host_pointer(state: &mut State, nested: &mut Nested) {
     let capture = state.wants_pointer_capture();
     let visible = state.wants_default_cursor();
-    let size = state.backend.window_size();
-    let window = state.backend.window();
+    let size = state.backend.winit().window_size();
+    let window = state.backend.winit().window();
 
     if capture != nested.pointer_captured {
         nested.pointer_captured = capture;

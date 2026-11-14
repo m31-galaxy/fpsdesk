@@ -1,8 +1,10 @@
 //! FPSDesk: a Wayland compositor navigable in first-person 3D.
 //!
-//! See `docs/PLAN.md` for the design. Runs nested in a window on a host session.
+//! See `docs/PLAN.md` for the design. Runs nested in a window on a host session,
+//! or as a real session on a virtual console.
 
 mod backend;
+mod frame;
 mod frame_stats;
 mod handlers;
 mod input;
@@ -14,19 +16,17 @@ mod world;
 use std::{error::Error, path::PathBuf, process::Command, time::Duration};
 
 use glam::Vec3;
-use smithay::{
-    backend::renderer::gles::GlesRenderer,
-    reexports::{
-        calloop::{
-            EventLoop,
-            timer::{TimeoutAction, Timer},
-        },
-        wayland_server::Display,
+use smithay::reexports::{
+    calloop::{
+        EventLoop,
+        timer::{TimeoutAction, Timer},
     },
+    wayland_server::Display,
 };
 use tracing::{error, info, warn};
 
 use crate::{
+    backend::{Backend, tty},
     script::Script,
     state::{Smoke, State},
     world::{Camera, EYE_HEIGHT},
@@ -44,18 +44,34 @@ Options:
       --camera <X,Z,YAW,PITCH>
                            Start X metres right of and Z metres behind the origin,
                            turned YAW degrees left and looking PITCH degrees up
+      --backend <nested|tty>
+                           nested: a window on the running desktop; tty: a real
+                           session on a virtual console. Default: nested if
+                           WAYLAND_DISPLAY or DISPLAY is set, else tty
+      --scale <FACTOR>     tty only: output scale, such as 2 for a HiDPI panel
+                           (default 1)
   -h, --help               Show this help
 
 Controls:
   Walk mode      W/A/S/D or arrows move, Shift runs, the mouse looks around.
                  Left click or Enter uses the window under the crosshair.
   Interact mode  Keys go to the focused window.
-  Either         Ctrl+Escape (or Super) switches between the two modes.";
+  Either         Ctrl+Escape (or Super) switches between the two modes.
+  tty backend    Ctrl+Alt+F1..F12 switches virtual console;
+                 Ctrl+Alt+Backspace quits.";
 
 /// How long a `--smoke` run may take before it counts as failed.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Nested,
+    Tty,
+}
+
 struct Args {
+    backend: Option<BackendKind>,
+    scale: f64,
     smoke: bool,
     screenshot: Option<PathBuf>,
     camera: Option<[f32; 4]>,
@@ -65,6 +81,8 @@ struct Args {
 
 fn parse_args() -> Result<Args, String> {
     let mut parsed = Args {
+        backend: None,
+        scale: 1.0,
         smoke: false,
         screenshot: None,
         camera: None,
@@ -75,6 +93,19 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--smoke" => parsed.smoke = true,
+            "--backend" => {
+                parsed.backend = Some(match args.next().as_deref() {
+                    Some("nested") => BackendKind::Nested,
+                    Some("tty") => BackendKind::Tty,
+                    _ => return Err("--backend needs `nested` or `tty`".into()),
+                });
+            }
+            "--scale" => {
+                let scale = args.next().and_then(|scale| scale.parse::<f64>().ok());
+                parsed.scale = scale
+                    .filter(|scale| *scale > 0.0)
+                    .ok_or("--scale needs a positive number")?;
+            }
             "--screenshot" => {
                 let path = args.next().ok_or("--screenshot needs a path")?;
                 parsed.screenshot = Some(path.into());
@@ -118,9 +149,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     let display: Display<State> = Display::new()?;
 
-    let (backend, winit) = smithay::backend::winit::init::<GlesRenderer>()?;
-    let mut state = State::new(&mut event_loop, display, backend)?;
-    backend::winit::init(&mut event_loop, &mut state, winit)?;
+    let mut state = match args.backend.unwrap_or_else(default_backend) {
+        BackendKind::Nested => {
+            let (backend, winit) = smithay::backend::winit::init()?;
+            let mut state =
+                State::new(&mut event_loop, display, Backend::Winit(Box::new(backend)))?;
+            backend::winit::init(&mut event_loop, &mut state, winit)?;
+            state
+        }
+        BackendKind::Tty => {
+            let (backend, events) = tty::Tty::new()?;
+            let backend = Backend::Tty(Box::new(backend));
+            let mut state = State::new(&mut event_loop, display, backend)?;
+            tty::init(&mut event_loop, &mut state, events, args.scale)?;
+            state
+        }
+    };
 
     if let Some([x, z, yaw, pitch]) = args.camera {
         state.camera = Camera::new(
@@ -158,11 +202,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         spawn_client(command, &state);
     }
 
-    event_loop.run(None, &mut state, |_| {})?;
+    let result = event_loop.run(None, &mut state, |_| {});
+    // Give the display back before anything else is torn down, even if the
+    // loop failed.
+    state.backend.shutdown();
+    result?;
 
     match state.smoke {
         Some(Smoke { passed: false, .. }) => Err("smoke test failed".into()),
         _ => Ok(()),
+    }
+}
+
+/// Nested if there is a desktop to be nested in, else a real session.
+fn default_backend() -> BackendKind {
+    let has = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
+    if has("WAYLAND_DISPLAY") || has("DISPLAY") {
+        BackendKind::Nested
+    } else {
+        BackendKind::Tty
     }
 }
 

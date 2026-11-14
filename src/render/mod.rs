@@ -8,6 +8,7 @@
 //!
 //! Nothing here depends on which backend owns the output.
 
+mod cursor;
 mod gl;
 pub mod scene;
 pub mod screenshot;
@@ -21,13 +22,16 @@ use smithay::{
         Color32F, Renderer,
         damage::OutputDamageTracker,
         element::{
-            Id, Kind, render_elements,
+            Id, Kind,
+            memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+            render_elements,
             solid::SolidColorRenderElement,
             surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             texture::TextureRenderElement,
             utils::RescaleRenderElement,
         },
         gles::{GlesRenderer, GlesTarget, GlesTexture},
+        sync::SyncPoint,
         utils::CommitCounter,
     },
     input::pointer::CursorImageSurfaceData,
@@ -40,6 +44,7 @@ use crate::{
     state::{Highlight, WindowEntry},
     world::{Camera, PIXELS_PER_METRE, Panel},
 };
+pub use cursor::BuiltinCursor;
 use scene::{Quad, SceneRenderer};
 use window::WindowTexture;
 
@@ -60,6 +65,7 @@ render_elements! {
     World=TextureRenderElement<GlesTexture>,
     Overlay=SolidColorRenderElement,
     Cursor=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    BuiltinCursor=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
 /// What pass 3 draws over the world.
@@ -69,6 +75,8 @@ pub struct Overlays<'a> {
     pub crosshair: bool,
     /// A client's cursor image.
     pub cursor: Option<CursorSprite<'a>>,
+    /// The built-in arrow, for backends with no host cursor.
+    pub builtin_cursor: Option<BuiltinCursor>,
 }
 
 /// A cursor image supplied by a client, and where to draw it.
@@ -144,6 +152,7 @@ pub struct Presenter {
     world_id: Id,
     crosshair_ids: [Id; 4],
     damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
+    arrow: MemoryRenderBuffer,
 }
 
 impl Presenter {
@@ -152,6 +161,7 @@ impl Presenter {
             world_id: Id::new(),
             crosshair_ids: std::array::from_fn(|_| Id::new()),
             damage_tracker: None,
+            arrow: cursor::arrow_buffer(),
         }
     }
 
@@ -165,7 +175,7 @@ impl Presenter {
         transform: Transform,
         world: GlesTexture,
         overlays: Overlays<'_>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<SyncPoint, Box<dyn Error>> {
         if self.damage_tracker.as_ref().is_none_or(|(s, _)| *s != size) {
             // Scale 1: everything here is positioned in output pixels.
             self.damage_tracker = Some((size, OutputDamageTracker::new(size, 1.0, transform)));
@@ -174,6 +184,11 @@ impl Presenter {
 
         // Front to back: the first element is drawn on top.
         let mut elements: Vec<OutputElement> = Vec::new();
+
+        if let Some(builtin) = overlays.builtin_cursor {
+            let element = cursor::arrow_element(renderer, &self.arrow, builtin)?;
+            elements.push(OutputElement::BuiltinCursor(element));
+        }
 
         if let Some(cursor) = overlays.cursor {
             let hotspot = with_states(cursor.surface, |states| {
@@ -251,7 +266,8 @@ impl Presenter {
         ));
 
         // Age 0: the world changes every frame, so always redraw all of it.
-        damage_tracker.render_output(renderer, framebuffer, 0, &elements, Color32F::BLACK)?;
-        Ok(())
+        let result =
+            damage_tracker.render_output(renderer, framebuffer, 0, &elements, Color32F::BLACK)?;
+        Ok(result.sync)
     }
 }

@@ -4,7 +4,6 @@ use std::{collections::HashSet, ffi::OsString, path::PathBuf, sync::Arc, time::I
 
 use glam::{Vec2, Vec3};
 use smithay::{
-    backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
     desktop::{PopupManager, Window, space::SpaceElement},
     input::{Seat, SeatState, pointer::CursorImageStatus},
     output::Output,
@@ -29,6 +28,7 @@ use smithay::{
 };
 
 use crate::{
+    backend::Backend,
     handlers,
     input::controls::{Mode, MoveKeys},
     render::{
@@ -102,8 +102,8 @@ pub struct State {
     pub display_handle: DisplayHandle,
     pub loop_signal: LoopSignal,
 
-    /// The nested window we render into, and the GL renderer that owns its context.
-    pub backend: WinitGraphicsBackend<GlesRenderer>,
+    /// The backend that owns the output and the GL renderer.
+    pub backend: Backend,
     pub scene: SceneRenderer,
     /// Outputs the backend has created.
     pub outputs: Vec<Output>,
@@ -160,7 +160,7 @@ impl State {
     pub fn new(
         event_loop: &mut EventLoop<State>,
         display: Display<State>,
-        mut backend: WinitGraphicsBackend<GlesRenderer>,
+        mut backend: Backend,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dh = display.handle();
 
