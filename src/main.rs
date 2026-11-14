@@ -3,6 +3,7 @@
 //! See `docs/PLAN.md` for the design. Runs nested in a window on a host session.
 
 mod backend;
+mod frame_stats;
 mod handlers;
 mod input;
 mod render;
@@ -11,6 +12,7 @@ mod world;
 
 use std::{error::Error, path::PathBuf, process::Command, time::Duration};
 
+use glam::Vec3;
 use smithay::{
     backend::renderer::gles::GlesRenderer,
     reexports::{
@@ -23,7 +25,10 @@ use smithay::{
 };
 use tracing::{error, info, warn};
 
-use crate::state::{Smoke, State};
+use crate::{
+    state::{Smoke, State},
+    world::{Camera, EYE_HEIGHT},
+};
 
 const USAGE: &str = "\
 Usage: fpsdesk [OPTIONS]
@@ -33,7 +38,16 @@ Options:
       --smoke              Self-test: exit 0 after 60 frames, or exit 1 after 10 s.
                            With -c, frames only count once a client window is shown
       --screenshot <PATH>  With --smoke: save the last frame to PATH as a PNG
-  -h, --help               Show this help";
+      --camera <X,Z,YAW,PITCH>
+                           Start X metres right of and Z metres behind the origin,
+                           turned YAW degrees left and looking PITCH degrees up
+  -h, --help               Show this help
+
+Controls:
+  Walk mode      W/A/S/D or arrows move, Shift runs, the mouse looks around.
+                 Left click or Enter uses the window under the crosshair.
+  Interact mode  Keys go to the focused window.
+  Either         Ctrl+Escape (or Super) switches between the two modes.";
 
 /// How long a `--smoke` run may take before it counts as failed.
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -41,6 +55,7 @@ const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 struct Args {
     smoke: bool,
     screenshot: Option<PathBuf>,
+    camera: Option<[f32; 4]>,
     commands: Vec<String>,
 }
 
@@ -48,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
     let mut parsed = Args {
         smoke: false,
         screenshot: None,
+        camera: None,
         commands: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
@@ -57,6 +73,12 @@ fn parse_args() -> Result<Args, String> {
             "--screenshot" => {
                 let path = args.next().ok_or("--screenshot needs a path")?;
                 parsed.screenshot = Some(path.into());
+            }
+            "--camera" => {
+                let pose = args.next().ok_or("--camera needs X,Z,YAW,PITCH")?;
+                let numbers: Result<Vec<f32>, _> = pose.split(',').map(str::parse).collect();
+                let pose = numbers.ok().and_then(|numbers| numbers.try_into().ok());
+                parsed.camera = Some(pose.ok_or("--camera needs four numbers: X,Z,YAW,PITCH")?);
             }
             "-c" | "--command" => {
                 let command = args.next().ok_or(format!("{arg} needs a command"))?;
@@ -76,7 +98,13 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = parse_args().map_err(|err| format!("{err}\n\n{USAGE}"))?;
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(err) => {
+            eprintln!("fpsdesk: {err}\n\n{USAGE}");
+            std::process::exit(2);
+        }
+    };
     init_logging();
 
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
@@ -86,7 +114,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut state = State::new(&mut event_loop, display, backend)?;
     backend::winit::init(&mut event_loop, &mut state, winit)?;
 
+    if let Some([x, z, yaw, pitch]) = args.camera {
+        state.camera = Camera::new(
+            Vec3::new(x, EYE_HEIGHT, z),
+            yaw.to_radians(),
+            pitch.to_radians(),
+        );
+    }
+
     info!(socket = ?state.socket_name, "listening for Wayland clients");
+    info!("walk mode: WASD and mouse move you; Ctrl+Escape releases the mouse");
 
     if args.smoke {
         state.smoke = Some(Smoke {

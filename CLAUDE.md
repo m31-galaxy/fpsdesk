@@ -32,6 +32,8 @@ nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
 - `--smoke` exits 0 after 60 frames; with `-c <client>` the frames only count
   once that client's window has been drawn, and it exits 1 after 10 s otherwise.
 - `--screenshot` saves the final frame as a PNG; open it with the Read tool.
+- `--camera X,Z,YAW,PITCH` (metres and degrees) starts the view somewhere else,
+  for screenshots of a particular angle.
 - `scripts/headless-run` uses a headless Weston as the host session. Always use
   it for automated runs: on the user's real desktop the nested window pops up on
   their screen, and it draws no frames at all while their screen is locked, so
@@ -40,7 +42,12 @@ nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
   update, which shows whether a client's frames are arriving.
 
 There is no way to inject input from here. Ask the user to check typing,
-clicking and movement by hand, and say plainly that they are unverified.
+clicking and movement by hand, and say plainly that they are unverified. Keep
+the rules behind input (camera, picking, movement keys, modes) in the pure
+`world/` and `input/controls.rs` code, where unit tests can reach them.
+
+Headless Weston has no pointer and no relative-pointer protocol, so the nested
+backend's mouse-capture path only runs on the user's real desktop.
 
 ## Commits
 

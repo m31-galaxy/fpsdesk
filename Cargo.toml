@@ -11,6 +11,9 @@ glam = "0.34.3"
 png = "0.18.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
 
 # Smithay's last crates.io release (0.7.0, mid-2025) is far behind master, so we
 # pin a git revision instead, as niri and cosmic-comp do. Bump it deliberately:

@@ -7,7 +7,7 @@
 
 use std::error::Error;
 
-use glam::Mat4;
+use glam::{Mat4, Quat, Vec3};
 use smithay::{
     backend::renderer::gles::{
         GlesRenderer, GlesTexture,
@@ -17,8 +17,20 @@ use smithay::{
 };
 
 use super::gl;
+use crate::world::Camera;
 
-const VERTEX_SHADER: &str = "#version 300 es
+// The palette. The ground fades into `HORIZON` with distance, which is also
+// the sky's colour at eye level, so the two meet without a seam.
+const ZENITH: [f32; 3] = [0.015, 0.02, 0.05];
+const HORIZON: [f32; 3] = [0.10, 0.13, 0.20];
+const GROUND: [f32; 3] = [0.045, 0.055, 0.075];
+const GRID_LINE: [f32; 3] = [0.22, 0.30, 0.42];
+
+/// Side of the square of ground drawn around the viewer, in metres. Twice the
+/// camera's far distance, so its edge is never in view.
+const GROUND_SIZE: f32 = 1000.0;
+
+const QUAD_VERTEX: &str = "#version 300 es
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_uv;
 uniform mat4 u_mvp;
@@ -29,13 +41,82 @@ void main() {
 }
 ";
 
-const FRAGMENT_SHADER: &str = "#version 300 es
+const QUAD_FRAGMENT: &str = "#version 300 es
 precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
+uniform vec4 u_tint;
 out vec4 color;
 void main() {
-    color = texture(u_texture, v_uv);
+    color = texture(u_texture, v_uv) * u_tint;
+}
+";
+
+/// One triangle covering the whole screen, with the world-space direction each
+/// pixel looks in.
+const SKY_VERTEX: &str = "#version 300 es
+uniform mat4 u_inverse_view_projection;
+uniform vec3 u_eye;
+out vec3 v_direction;
+void main() {
+    vec2 position = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)) * 2.0 - 1.0;
+    vec4 far = u_inverse_view_projection * vec4(position, 1.0, 1.0);
+    v_direction = far.xyz / far.w - u_eye;
+    gl_Position = vec4(position, 1.0, 1.0);
+}
+";
+
+const SKY_FRAGMENT: &str = "#version 300 es
+precision highp float;
+in vec3 v_direction;
+uniform vec3 u_horizon;
+uniform vec3 u_zenith;
+out vec4 color;
+void main() {
+    float height = normalize(v_direction).y;
+    color = vec4(mix(u_horizon, u_zenith, smoothstep(0.0, 0.5, height)), 1.0);
+}
+";
+
+const GROUND_VERTEX: &str = "#version 300 es
+layout(location = 0) in vec2 a_position;
+uniform mat4 u_model;
+uniform mat4 u_view_projection;
+out vec2 v_world;
+void main() {
+    vec4 world = u_model * vec4(a_position, 0.0, 1.0);
+    v_world = world.xz;
+    gl_Position = u_view_projection * world;
+}
+";
+
+/// A grid of lines every metre, with stronger ones every ten.
+const GROUND_FRAGMENT: &str = "#version 300 es
+precision highp float;
+in vec2 v_world;
+uniform vec3 u_eye;
+uniform vec3 u_ground;
+uniform vec3 u_line;
+uniform vec3 u_horizon;
+out vec4 color;
+
+// 1 on a grid line and 0 between lines, about 1.5 pixels wide whatever the
+// distance. Fades out where cells shrink towards a pixel, which would
+// otherwise shimmer.
+float grid(float spacing) {
+    vec2 cell = v_world / spacing;
+    vec2 cells_per_pixel = fwidth(cell);
+    vec2 pixels_from_line = abs(fract(cell - 0.5) - 0.5) / cells_per_pixel;
+    float line = 1.0 - min(min(pixels_from_line.x, pixels_from_line.y) / 1.5, 1.0);
+    float density = max(cells_per_pixel.x, cells_per_pixel.y);
+    return line * (1.0 - smoothstep(0.1, 0.5, density));
+}
+
+void main() {
+    float lines = max(grid(1.0) * 0.5, grid(10.0));
+    vec3 surface = mix(u_ground, u_line, lines);
+    float visibility = exp(-distance(v_world, u_eye.xz) * 0.02);
+    color = vec4(mix(u_horizon, surface, visibility), 1.0);
 }
 ";
 
@@ -55,13 +136,44 @@ pub struct Quad {
     pub model: Mat4,
     /// GL name of a 2D texture with premultiplied alpha.
     pub texture: u32,
+    /// A border to draw around the quad: the placement of a slightly larger
+    /// rectangle in the same plane, and its colour.
+    pub outline: Option<(Mat4, [f32; 3])>,
 }
 
-pub struct SceneRenderer {
+struct QuadProgram {
     program: u32,
     u_mvp: i32,
     u_texture: i32,
+    u_tint: i32,
+}
+
+struct SkyProgram {
+    program: u32,
+    u_inverse_view_projection: i32,
+    u_eye: i32,
+    u_horizon: i32,
+    u_zenith: i32,
+}
+
+struct GroundProgram {
+    program: u32,
+    u_model: i32,
+    u_view_projection: i32,
+    u_eye: i32,
+    u_ground: i32,
+    u_line: i32,
+    u_horizon: i32,
+}
+
+pub struct SceneRenderer {
+    quad: QuadProgram,
+    sky: SkyProgram,
+    ground: GroundProgram,
+    /// The unit quad.
     vao: u32,
+    /// A single white texel, for drawing plain colours with the quad program.
+    white: u32,
     target: Option<Target>,
 }
 
@@ -89,9 +201,36 @@ impl SceneRenderer {
                 return Err(format!("OpenGL ES 3.0 or newer is required, got {version:?}").into());
             }
 
-            let program = gl::link_program(gl, VERTEX_SHADER, FRAGMENT_SHADER)?;
-            let u_mvp = gl.GetUniformLocation(program, c"u_mvp".as_ptr());
-            let u_texture = gl.GetUniformLocation(program, c"u_texture".as_ptr());
+            let uniform =
+                |program, name: &std::ffi::CStr| gl.GetUniformLocation(program, name.as_ptr());
+
+            let program = gl::link_program(gl, QUAD_VERTEX, QUAD_FRAGMENT)?;
+            let quad = QuadProgram {
+                program,
+                u_mvp: uniform(program, c"u_mvp"),
+                u_texture: uniform(program, c"u_texture"),
+                u_tint: uniform(program, c"u_tint"),
+            };
+
+            let program = gl::link_program(gl, SKY_VERTEX, SKY_FRAGMENT)?;
+            let sky = SkyProgram {
+                program,
+                u_inverse_view_projection: uniform(program, c"u_inverse_view_projection"),
+                u_eye: uniform(program, c"u_eye"),
+                u_horizon: uniform(program, c"u_horizon"),
+                u_zenith: uniform(program, c"u_zenith"),
+            };
+
+            let program = gl::link_program(gl, GROUND_VERTEX, GROUND_FRAGMENT)?;
+            let ground = GroundProgram {
+                program,
+                u_model: uniform(program, c"u_model"),
+                u_view_projection: uniform(program, c"u_view_projection"),
+                u_eye: uniform(program, c"u_eye"),
+                u_ground: uniform(program, c"u_ground"),
+                u_line: uniform(program, c"u_line"),
+                u_horizon: uniform(program, c"u_horizon"),
+            };
 
             let mut vao = 0;
             let mut vbo = 0;
@@ -120,25 +259,51 @@ impl SceneRenderer {
             gl.BindVertexArray(0);
             gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
 
+            let mut white = 0;
+            gl.GenTextures(1, &mut white);
+            gl.BindTexture(ffi::TEXTURE_2D, white);
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::RGBA8 as i32,
+                1,
+                1,
+                0,
+                ffi::RGBA,
+                ffi::UNSIGNED_BYTE,
+                [0xffu8; 4].as_ptr().cast(),
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+
             Ok(Self {
-                program,
-                u_mvp,
-                u_texture,
+                quad,
+                sky,
+                ground,
                 vao,
+                white,
                 target: None,
             })
         })?
     }
 
-    /// Draw `quads`, already ordered back to front, as seen through
-    /// `view_projection`. Returns the texture holding the finished image; its
+    /// Draw the sky, the ground and `quads` (already ordered back to front) as
+    /// seen by `camera`. Returns the texture holding the finished image; its
     /// first row is the bottom of the picture, as usual for GL framebuffers.
     pub fn render(
         &mut self,
         renderer: &mut GlesRenderer,
         size: Size<i32, Physical>,
-        view_projection: Mat4,
-        sky: [f32; 3],
+        camera: &Camera,
         quads: &[Quad],
     ) -> Result<GlesTexture, Box<dyn Error>> {
         if self
@@ -153,44 +318,114 @@ impl SceneRenderer {
         }
         let target = self.target.as_ref().expect("target was just created");
 
+        let view_projection = camera.view_projection(size.w as f32 / size.h as f32);
+        let eye = camera.position;
+
         renderer.with_context(|gl| unsafe {
             gl.BindFramebuffer(ffi::FRAMEBUFFER, target.framebuffer);
             gl.Viewport(0, 0, size.w, size.h);
             gl.Disable(ffi::SCISSOR_TEST);
+            gl.Disable(ffi::BLEND);
+            gl.Clear(ffi::DEPTH_BUFFER_BIT);
+            gl.BindVertexArray(self.vao);
+
+            // The sky covers every pixel, so it doubles as the colour clear.
+            gl.Disable(ffi::DEPTH_TEST);
+            self.draw_sky(gl, view_projection, eye);
+
             gl.Enable(ffi::DEPTH_TEST);
-            gl.ClearColor(sky[0], sky[1], sky[2], 1.0);
-            gl.Clear(ffi::COLOR_BUFFER_BIT | ffi::DEPTH_BUFFER_BIT);
+            self.draw_ground(gl, view_projection, eye);
 
             // Window textures are premultiplied.
             gl.Enable(ffi::BLEND);
             gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
-
-            gl.UseProgram(self.program);
-            gl.BindVertexArray(self.vao);
-            gl.ActiveTexture(ffi::TEXTURE0);
-            gl.Uniform1i(self.u_texture, 0);
-            for quad in quads {
-                let mvp = (view_projection * quad.model).to_cols_array();
-                gl.UniformMatrix4fv(self.u_mvp, 1, ffi::FALSE, mvp.as_ptr());
-                gl.BindTexture(ffi::TEXTURE_2D, quad.texture);
-                gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
-            }
+            self.draw_quads(gl, view_projection, quads);
 
             restore_smithay_state(gl);
         })?;
 
         Ok(target.color.clone())
     }
+
+    unsafe fn draw_sky(&self, gl: &Gles2, view_projection: Mat4, eye: Vec3) {
+        let sky = &self.sky;
+        unsafe {
+            gl.UseProgram(sky.program);
+            set_mat4(gl, sky.u_inverse_view_projection, view_projection.inverse());
+            set_vec3(gl, sky.u_eye, eye.to_array());
+            set_vec3(gl, sky.u_horizon, HORIZON);
+            set_vec3(gl, sky.u_zenith, ZENITH);
+            gl.DrawArrays(ffi::TRIANGLES, 0, 3);
+        }
+    }
+
+    unsafe fn draw_ground(&self, gl: &Gles2, view_projection: Mat4, eye: Vec3) {
+        let ground = &self.ground;
+        // Lay the unit quad flat and keep it centred under the viewer. The
+        // grid is computed from world coordinates, so it stays put.
+        let model = Mat4::from_scale_rotation_translation(
+            Vec3::splat(GROUND_SIZE),
+            Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2),
+            Vec3::new(eye.x, 0.0, eye.z),
+        );
+        unsafe {
+            gl.UseProgram(ground.program);
+            set_mat4(gl, ground.u_model, model);
+            set_mat4(gl, ground.u_view_projection, view_projection);
+            set_vec3(gl, ground.u_eye, eye.to_array());
+            set_vec3(gl, ground.u_ground, GROUND);
+            set_vec3(gl, ground.u_line, GRID_LINE);
+            set_vec3(gl, ground.u_horizon, HORIZON);
+            gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
+        }
+    }
+
+    unsafe fn draw_quads(&self, gl: &Gles2, view_projection: Mat4, quads: &[Quad]) {
+        let quad_program = &self.quad;
+        unsafe {
+            gl.UseProgram(quad_program.program);
+            gl.ActiveTexture(ffi::TEXTURE0);
+            gl.Uniform1i(quad_program.u_texture, 0);
+
+            for quad in quads {
+                if let Some((model, [r, g, b])) = quad.outline {
+                    // The outline is in the same plane as its quad. Leaving it
+                    // out of the depth buffer lets the quad draw over it.
+                    gl.DepthMask(ffi::FALSE);
+                    set_mat4(gl, quad_program.u_mvp, view_projection * model);
+                    gl.Uniform4f(quad_program.u_tint, r, g, b, 1.0);
+                    gl.BindTexture(ffi::TEXTURE_2D, self.white);
+                    gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
+                    gl.DepthMask(ffi::TRUE);
+                }
+
+                set_mat4(gl, quad_program.u_mvp, view_projection * quad.model);
+                gl.Uniform4f(quad_program.u_tint, 1.0, 1.0, 1.0, 1.0);
+                gl.BindTexture(ffi::TEXTURE_2D, quad.texture);
+                gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
+            }
+        }
+    }
+}
+
+unsafe fn set_mat4(gl: &Gles2, location: i32, matrix: Mat4) {
+    unsafe { gl.UniformMatrix4fv(location, 1, ffi::FALSE, matrix.to_cols_array().as_ptr()) }
+}
+
+unsafe fn set_vec3(gl: &Gles2, location: i32, [x, y, z]: [f32; 3]) {
+    unsafe { gl.Uniform3f(location, x, y, z) }
 }
 
 /// Undo the state changes Smithay's renderer does not make for itself.
 ///
 /// Smithay sets the framebuffer, viewport, blending, scissor, program, active
 /// texture and vertex attributes itself before it draws. It never touches
-/// depth testing or vertex array objects, so it relies on those being off.
+/// depth testing, the depth mask or vertex array objects, so it relies on
+/// those being at their defaults.
 unsafe fn restore_smithay_state(gl: &Gles2) {
     unsafe {
         gl.Disable(ffi::DEPTH_TEST);
+        gl.DepthMask(ffi::TRUE);
         gl.BindVertexArray(0);
         gl.UseProgram(0);
         gl.BindTexture(ffi::TEXTURE_2D, 0);

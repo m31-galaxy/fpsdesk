@@ -3,9 +3,9 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0, M1 and M2 done.** Windows are drawn on panels in a 3D scene seen
-from a fixed camera. The pointer is not routed to clients until ray picking
-exists; keys go to the newest window. Next up is M3.
+Status: **M0 to M3 done.** You can walk around windows standing in an open
+space, focus one and type into it. The pointer is not routed to clients yet.
+Next up is M4.
 
 ## Decisions
 
@@ -104,16 +104,18 @@ popups and drag all come from the same code path.
 ```
           click or Enter on a panel
   WALK  ---------------------------->  INTERACT
-        <----------------------------
-           Super (compositor-reserved)
+        <--------------------------->
+           Ctrl+Escape or Super (compositor-reserved; toggles)
 ```
 
 - **Walk:** WASD moves, mouse looks, crosshair highlights the panel it is on. No
   client has keyboard focus. Compositor bindings (launch, close, grab) live here.
 - **Interact:** the keyboard belongs to the focused client. On entry the camera
   can ease to face the panel squarely at a distance where it is comfortably
-  readable. A single reserved key returns to walk mode; everything else reaches
-  the app.
+  readable. The reserved binding returns to walk mode; everything else reaches
+  the app. Entering it with nothing under the crosshair just frees the mouse.
+- **The reserved binding** is Super in a real session. Nested under a desktop,
+  the host keeps Super for itself, so Ctrl+Escape does the same job.
 - **Grab** (M5) is a sub-mode of walk: the panel under the crosshair follows the
   camera so it can be carried, pushed, pulled, rotated and resized.
 
@@ -143,8 +145,9 @@ scroll, cursor image, popups and menus. *Done when* a terminal and a GTK app
 with menus are properly usable from inside the world.
 
 **M5 - Spatial window management.** Where new windows spawn; grab, move, rotate,
-resize, close; a launcher binding; a config file; the legibility work (mipmaps,
-anisotropic filtering, snap-to-face on focus, client render scale).
+resize, close; a launcher binding; a config file; the legibility work
+(anisotropic filtering, antialiased panel edges, snap-to-face on focus, client
+render scale); dithering to hide banding in the dark ground and sky gradients.
 *Done when* the nested build is a complete, pleasant demo.
 
 **M6 - Real session.** udev/DRM/libinput/libseat backend, VT switching, vblank-
@@ -177,11 +180,13 @@ whatever using it day to day shows up.
    and pixel-perfect.
 2. **Mouselook in nested mode.** Smithay's winit backend reports only absolute
    pointer positions (`PointerMotionEvent = UnusedEvent`) and never locks the
-   host cursor, so the pointer stops at the window edge. Options, cheapest first:
-   derive deltas from absolute motion and accept the edge during M3; lock the
-   cursor through `backend.window()` and carry a small patch to the winit backend
-   that forwards raw device motion; or write our own nested backend. The DRM
-   backend has no such problem, since libinput is relative by nature.
+   host cursor. Handled in M3 without patching Smithay: the pointer is locked
+   and hidden through winit's own window API, and
+   `backend/relative_pointer.rs` opens a second event queue on winit's
+   connection to the host to receive relative-pointer events directly. On a
+   host without that protocol (X11, headless Weston) mouselook falls back to
+   differences between absolute positions and stops at the window's edge. The
+   DRM backend has no such problem, since libinput is relative by nature.
 3. **Sharing GL state with Smithay.** The renderer's GL state is an
    implementation detail we must leave as we found it. Contained by the
    `render/` boundary and by pass 2 drawing only into our own framebuffer.
@@ -191,9 +196,14 @@ whatever using it day to day shows up.
    within. Plan: popups are extra quads in the parent's plane, constrained to a
    generous virtual rectangle around the parent.
 6. **Performance on integrated graphics.** Regenerating mipmaps for large,
-   busy windows each frame may be costly at 120 Hz on a high-DPI panel. Not
-   measured yet: do it in M3, once there is a frame-time readout. Fall-backs
-   are throttled mipmap updates and a lower world resolution.
+   busy windows each frame looked like it might be costly. Measured in M3 on
+   this laptop (Intel Arc B390) with a constantly scrolling 2560x1600 terminal
+   and `glFinish` after every frame: about 3.9 ms per frame with mipmaps
+   against 3.5 ms without, and 0.7 ms for an empty scene. Mipmaps are not the
+   problem; most of the cost is uploading the window's pixels. That was with a
+   1280x800 output, so re-measure at the panel's full resolution in M6. The
+   8.3 ms budget of a 120 Hz display leaves room. `RUST_LOG=fpsdesk::frame_stats=debug`
+   logs frame times (CPU side only).
 7. **Nested mode stalls when hidden.** The nested backend redraws only when
    the host asks for a frame, and a desktop stops asking while the window is
    hidden or the screen is locked, which also freezes the clients inside.

@@ -1,15 +1,15 @@
 //! Compositor state: the Smithay protocol states, the seat, and the windows.
 
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashSet, ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
 
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
     desktop::{PopupManager, Window, space::SpaceElement},
     input::{Seat, SeatState},
     output::Output,
     reexports::{
-        calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
+        calloop::{self, EventLoop, Interest, LoopSignal, PostAction, generic::Generic},
         wayland_server::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason},
@@ -30,6 +30,7 @@ use smithay::{
 
 use crate::{
     handlers,
+    input::controls::{Mode, MoveKeys},
     render::{scene::SceneRenderer, window::WindowTexture},
     world::{self, Camera, EYE_HEIGHT, Panel},
 };
@@ -42,6 +43,18 @@ pub struct WindowEntry {
     pub panel: Panel,
     /// The window's flattened picture; `None` until it first has content.
     pub texture: Option<WindowTexture>,
+    /// Whether to draw attention to the window this frame.
+    pub highlight: Highlight,
+}
+
+/// Why a window is outlined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Highlight {
+    None,
+    /// The crosshair is on it in walk mode.
+    Hovered,
+    /// It has keyboard focus in interact mode.
+    Focused,
 }
 
 /// Bookkeeping for `--smoke` runs. See `main.rs`.
@@ -66,7 +79,22 @@ pub struct State {
     /// Outputs the backend has created.
     pub outputs: Vec<Output>,
 
+    pub mode: Mode,
+    pub move_keys: MoveKeys,
+    /// Pointer movement, in logical pixels, not yet applied to the camera.
+    pub look_motion: Vec2,
+    /// Whether the backend delivers relative pointer motion. Without it,
+    /// mouselook falls back to differences between absolute positions.
+    pub has_relative_pointer: bool,
+    pub last_pointer_position: Option<Vec2>,
+    /// Keys whose press we kept for ourselves, by xkb key code.
+    pub suppressed_keys: HashSet<u32>,
+
     pub camera: Camera,
+    /// The window under the crosshair.
+    pub hovered: Option<Window>,
+    /// The window with keyboard focus.
+    pub focused: Option<Window>,
     pub windows: Vec<WindowEntry>,
     pub popups: PopupManager,
 
@@ -108,12 +136,9 @@ impl State {
 
         let scene = SceneRenderer::new(backend.renderer())?;
 
-        // Fixed until M3 adds movement. Windows are arranged around the
-        // origin; standing off to one side shows them in perspective.
-        let camera = Camera::looking_at(
-            Vec3::new(0.5, EYE_HEIGHT, 0.6),
-            Vec3::new(0.35, EYE_HEIGHT, -1.5),
-        );
+        // Windows are arranged around the origin, so start in the middle of
+        // them, looking at the first.
+        let camera = Camera::new(Vec3::new(0.0, EYE_HEIGHT, 0.0), 0.0, 0.0);
 
         let socket_name = Self::listen(display, event_loop)?;
 
@@ -125,7 +150,15 @@ impl State {
             backend,
             scene,
             outputs: Vec::new(),
+            mode: Mode::Walk,
+            move_keys: MoveKeys::default(),
+            look_motion: Vec2::ZERO,
+            has_relative_pointer: false,
+            last_pointer_position: None,
+            suppressed_keys: HashSet::new(),
             camera,
+            hovered: None,
+            focused: None,
             windows: Vec::new(),
             popups: PopupManager::default(),
             compositor_state,
@@ -160,7 +193,7 @@ impl State {
         })?;
 
         handle.insert_source(
-            Generic::new(display, Interest::READ, Mode::Level),
+            Generic::new(display, Interest::READ, calloop::Mode::Level),
             |_, display, state| {
                 // Safety: the display is never dropped while the source is alive.
                 unsafe { display.get_mut().dispatch_clients(state)? };
@@ -179,7 +212,7 @@ impl State {
             .find(|window| window.toplevel().is_some_and(|t| t.wl_surface() == surface))
     }
 
-    /// Start managing a new window: give it a place in the world and focus it.
+    /// Start managing a new window: give it a place in the world.
     pub fn add_window(&mut self, window: Window) {
         let slot = (0..)
             .find(|slot| self.windows.iter().all(|entry| entry.slot != *slot))
@@ -189,8 +222,14 @@ impl State {
             slot,
             panel: world::arc_slot(slot),
             texture: None,
+            highlight: Highlight::None,
         });
-        self.focus_window(Some(&window));
+        // While the user is working in an application, a window it opens (a
+        // dialog, say) should take over the keyboard. While they are walking,
+        // nothing should.
+        if self.mode == Mode::Interact {
+            self.focus_window(Some(&window));
+        }
     }
 
     /// Give keyboard focus to `window`, or clear focus with `None`.
@@ -198,6 +237,7 @@ impl State {
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
 
+        self.focused = window.cloned();
         for entry in &self.windows {
             entry.window.set_activated(Some(&entry.window) == window);
         }
@@ -220,19 +260,14 @@ impl State {
     /// Per-frame housekeeping: forget closed windows and keep the rest
     /// informed about the output they are shown on.
     pub fn refresh(&mut self) {
-        let count = self.windows.len();
         self.windows.retain(|entry| entry.window.alive());
 
-        // Until there is a way to pick a window, typing would be stuck once
-        // the focused window closes; hand focus to the newest one left.
-        if self.windows.len() != count {
-            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
-            let focus = keyboard.current_focus();
-            let focus_remains = focus.is_some_and(|s| self.window_for_toplevel(&s).is_some());
-            if !focus_remains {
-                let newest = self.windows.last().map(|entry| entry.window.clone());
-                self.focus_window(newest.as_ref());
-            }
+        if self.hovered.as_ref().is_some_and(|window| !window.alive()) {
+            self.hovered = None;
+        }
+        // Closing the window you were using puts you back on your feet.
+        if self.focused.as_ref().is_some_and(|window| !window.alive()) {
+            self.enter_walk();
         }
 
         for entry in &self.windows {
