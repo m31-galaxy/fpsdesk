@@ -63,6 +63,13 @@ impl Extent {
     }
 }
 
+impl WindowTexture {
+    /// GL name of the texture. Premultiplied alpha, first row at the top.
+    pub fn id(&self) -> u32 {
+        self.texture.tex_id()
+    }
+}
+
 /// A window's current picture.
 pub struct WindowImage {
     /// GL name of the texture. Premultiplied alpha, first row at the top.

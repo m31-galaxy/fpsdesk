@@ -37,7 +37,8 @@ use crate::{
         window::{Extent, WindowTexture},
     },
     script::Script,
-    world::{self, Camera, EYE_HEIGHT, Panel},
+    shooting::Shooting,
+    world::{self, Camera, EYE_HEIGHT, Panel, combat::Damage},
 };
 
 /// A client window and its place in the world.
@@ -52,6 +53,8 @@ pub struct WindowEntry {
     pub texture: Option<WindowTexture>,
     /// Whether to draw attention to the window this frame.
     pub highlight: Highlight,
+    /// Bullet holes and the like; see `shooting.rs`.
+    pub damage: Damage,
 }
 
 impl WindowEntry {
@@ -93,6 +96,8 @@ pub struct Smoke {
     pub needs_window: bool,
     pub frames: u32,
     pub passed: bool,
+    /// Frames to render, once the script has finished, before passing.
+    pub frames_needed: u32,
     /// Where to save the final frame, if anywhere.
     pub screenshot: Option<PathBuf>,
 }
@@ -141,6 +146,7 @@ pub struct State {
     /// The window with keyboard focus.
     pub focused: Option<Window>,
     pub windows: Vec<WindowEntry>,
+    pub shooting: Shooting,
     pub popups: PopupManager,
 
     pub compositor_state: CompositorState,
@@ -213,6 +219,7 @@ impl State {
             hovered: None,
             focused: None,
             windows: Vec::new(),
+            shooting: Shooting::default(),
             popups: PopupManager::default(),
             compositor_state,
             xdg_shell_state,
@@ -278,6 +285,7 @@ impl State {
             extent: None,
             texture: None,
             highlight: Highlight::None,
+            damage: Damage::default(),
         });
         // While the user is working in an application, a window it opens (a
         // dialog, say) should take over the keyboard. While they are walking,
@@ -315,7 +323,7 @@ impl State {
     /// Per-frame housekeeping: forget closed windows and keep the rest
     /// informed about the output they are shown on.
     pub fn refresh(&mut self) {
-        self.windows.retain(|entry| entry.window.alive());
+        self.bury_dead_windows();
 
         if self.hovered.as_ref().is_some_and(|window| !window.alive()) {
             self.hovered = None;
@@ -337,8 +345,9 @@ impl State {
     }
 }
 
-/// Frames a `--smoke` run has to render before it passes.
-const SMOKE_FRAMES: u32 = 60;
+/// Frames a `--smoke` run has to render before it passes, unless
+/// `--smoke-frames` says otherwise.
+pub const SMOKE_FRAMES: u32 = 60;
 
 impl State {
     /// Count a rendered frame towards the smoke test. Returns true for the
@@ -358,12 +367,16 @@ impl State {
         }
         // A window gets its texture the first time it is drawn into the world.
         let window_shown = self.windows.iter().any(|entry| entry.texture.is_some());
+        // Once one has been seen, losing it again (shot dead, say) is fine.
+        if window_shown {
+            smoke.needs_window = false;
+        }
         if smoke.passed || (smoke.needs_window && !window_shown) {
             return false;
         }
 
         smoke.frames += 1;
-        if smoke.frames < SMOKE_FRAMES {
+        if smoke.frames < smoke.frames_needed {
             return false;
         }
         smoke.passed = true;

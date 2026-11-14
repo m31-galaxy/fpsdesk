@@ -10,6 +10,8 @@ use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
 use glam::{Mat4, Quat, Vec2, Vec3};
 
+pub mod combat;
+
 /// How many logical pixels of a window make one metre of panel. At 1000, a
 /// panel about a metre away shows roughly one window pixel per screen pixel.
 pub const PIXELS_PER_METRE: f32 = 1000.0;

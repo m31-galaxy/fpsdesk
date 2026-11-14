@@ -8,6 +8,7 @@
 //! Bindings:
 //! - Walk: W/A/S/D or arrows move, Shift runs, the mouse looks. Left click or
 //!   Enter on the window under the crosshair focuses it and enters interact.
+//!   Right click shoots it (see `shooting.rs`).
 //! - Interact: clicking a window focuses it; clicking on nothing returns to
 //!   walk mode.
 //! - Walk: the backtick or `/` key opens the launcher prompt, which takes every
@@ -51,6 +52,9 @@ use emergency::Emergency;
 
 /// The left mouse button's evdev code.
 pub const BTN_LEFT: u32 = 0x110;
+
+/// The right mouse button's evdev code.
+pub const BTN_RIGHT: u32 = 0x111;
 
 /// Scroll distance, in logical pixels, for one notch of a mouse wheel.
 const WHEEL_NOTCH_PIXELS: f64 = 15.0;
@@ -296,6 +300,8 @@ impl State {
                     self.suppressed_buttons.insert(button);
                     if button == BTN_LEFT {
                         self.use_hovered();
+                    } else if button == BTN_RIGHT {
+                        self.shoot();
                     }
                     return;
                 }
@@ -482,6 +488,7 @@ impl State {
     /// Advance the world by `dt` seconds: apply movement and mouselook, then
     /// work out what the crosshair or cursor is on.
     pub fn advance(&mut self, dt: f32) {
+        self.step_shooting(dt);
         if self.mode == Mode::Walk {
             let (yaw, pitch) = look_delta(std::mem::take(&mut self.look_motion));
             self.camera.turn(yaw, pitch);
@@ -513,7 +520,7 @@ impl State {
 
     /// The ray from the eye through a point on the screen given in normalised
     /// device coordinates (see `Camera::ray_through`).
-    fn ray_through(&self, ndc: Vec2) -> Option<Ray> {
+    pub(crate) fn ray_through(&self, ndc: Vec2) -> Option<Ray> {
         let size = self.view_size()?;
         Some(self.camera.ray_through(ndc, size.x / size.y))
     }

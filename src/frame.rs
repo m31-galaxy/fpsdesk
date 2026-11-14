@@ -36,7 +36,10 @@ use crate::{
     frame_stats::FrameStats,
     input::controls::Mode as ControlMode,
     prompt::Prompt,
-    render::{self, BuiltinCursor, CursorSprite, Overlays, Presenter, PromptSprite, screenshot},
+    render::{
+        self, BuiltinCursor, CursorSprite, Overlays, Presenter, PromptSprite, screenshot,
+        weapon::WeaponView,
+    },
     state::State,
 };
 
@@ -79,6 +82,8 @@ pub struct Prepared {
     cursor_surface: Option<WlSurface>,
     cursor_position: (i32, i32),
     builtin_cursor: bool,
+    /// The weapon, if it is on screen.
+    weapon: Option<WeaponView>,
     /// The launcher prompt as it stood, if it is open.
     prompt: Option<Prompt>,
     /// Where to save a screenshot of this frame, if this is the frame to take it.
@@ -112,6 +117,7 @@ impl Frame {
     ) -> Result<SyncPoint, Box<dyn Error>> {
         let params = prepared.params;
         let overlays = Overlays {
+            weapon: prepared.weapon,
             prompt: prepared.prompt.as_ref().map(|prompt| PromptSprite {
                 prompt,
                 scale: params.scale,
@@ -168,6 +174,7 @@ pub fn prepare(
         state.backend.renderer(),
         &mut state.scene,
         &mut state.windows,
+        &state.shooting.corpses,
         &state.camera,
         params.size,
         params.scale,
@@ -190,6 +197,7 @@ pub fn prepare(
         cursor_position: (cursor.x, cursor.y),
         builtin_cursor: params.builtin_cursor && state.wants_default_cursor(),
         prompt: state.prompt.is_open().then(|| state.prompt.clone()),
+        weapon: state.weapon_view(),
         screenshot,
     })
 }
