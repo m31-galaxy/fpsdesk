@@ -17,6 +17,8 @@
 //! | `move X Y`        | Put the pointer at X,Y on the output (logical px)   |
 //! | `press`/`release` | Left mouse button down or up                        |
 //! | `click`           | Left button down, then up on the next frame         |
+//! | `shoot`           | Right button down, then up on the next frame: fires |
+//! |                   | in walk mode, a context-menu click in interact mode |
 //! | `scroll PIXELS`   | Scroll vertically; positive is down                 |
 //! | `key CODE`        | Tap a key, by Linux evdev code (30 is A, 28 Enter)  |
 
@@ -28,7 +30,10 @@ use smithay::{
     input::{keyboard::Keycode, pointer::AxisFrame},
 };
 
-use crate::{input::BTN_LEFT, state::State};
+use crate::{
+    input::{BTN_LEFT, BTN_RIGHT},
+    state::State,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Step {
@@ -41,6 +46,8 @@ enum Step {
     Press,
     Release,
     Click,
+    Shoot,
+    ReleaseRight,
     Scroll(f64),
     Key(u32),
 }
@@ -153,6 +160,10 @@ fn parse_step(step: &str) -> Result<Step, String> {
             expect(0)?;
             Step::Click
         }
+        "shoot" => {
+            expect(0)?;
+            Step::Shoot
+        }
         "scroll" => {
             expect(1)?;
             Step::Scroll(number(0)?)
@@ -199,6 +210,13 @@ impl State {
                     script.steps.push_front(Step::Release);
                 }
             }
+            Step::Shoot => {
+                self.pointer_button(BTN_RIGHT, ButtonState::Pressed, now);
+                if let Some(script) = self.script.as_mut() {
+                    script.steps.push_front(Step::ReleaseRight);
+                }
+            }
+            Step::ReleaseRight => self.pointer_button(BTN_RIGHT, ButtonState::Released, now),
             Step::Scroll(pixels) => {
                 let frame = AxisFrame::new(now)
                     .source(AxisSource::Wheel)

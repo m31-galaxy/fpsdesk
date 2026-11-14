@@ -11,6 +11,8 @@
 mod gl;
 pub mod scene;
 pub mod screenshot;
+mod shards;
+pub mod weapon;
 pub mod window;
 
 use std::error::Error;
@@ -37,10 +39,12 @@ use smithay::{
 };
 
 use crate::{
+    shooting::CorpseEntry,
     state::{Highlight, WindowEntry},
     world::{Camera, PIXELS_PER_METRE, Panel},
 };
 use scene::{Quad, SceneRenderer};
+use weapon::{WeaponPainter, WeaponView};
 use window::WindowTexture;
 
 /// Width of the outline around a highlighted window, in metres.
@@ -69,6 +73,8 @@ pub struct Overlays<'a> {
     pub crosshair: bool,
     /// A client's cursor image.
     pub cursor: Option<CursorSprite<'a>>,
+    /// The weapon at the bottom of the view.
+    pub weapon: Option<WeaponView>,
 }
 
 /// A cursor image supplied by a client, and where to draw it.
@@ -87,6 +93,7 @@ pub fn render_world(
     renderer: &mut GlesRenderer,
     scene: &mut SceneRenderer,
     windows: &mut [WindowEntry],
+    corpses: &[CorpseEntry],
     camera: &Camera,
     size: Size<i32, Physical>,
     scale: f64,
@@ -107,6 +114,10 @@ pub fn render_world(
         let geometry = image.extent.geometry.size;
         entry.panel.size = Vec2::new(geometry.w as f32, geometry.h as f32) / PIXELS_PER_METRE;
         let content = entry.content_panel().unwrap_or(entry.panel);
+        // A window that has just been shot is knocked about and flashes red.
+        let pose = entry.damage.pose();
+        let displaced = |panel: Panel| pose.map_or(panel, |pose| pose.apply(&panel));
+        let flash = pose.map_or([0.0; 3], |pose| [0.9 * pose.flash, 0.1 * pose.flash, 0.0]);
 
         let outline = match entry.highlight {
             Highlight::None => None,
@@ -118,19 +129,26 @@ pub fn render_world(
                 size: entry.panel.size + 2.0 * OUTLINE_WIDTH,
                 ..entry.panel
             };
-            (border.model(), color)
+            (displaced(border).model(), color)
         });
 
         let distance = entry.panel.center.distance_squared(camera.position);
         quads.push((
             distance,
             Quad {
-                model: content.model(),
-                texture: image.texture,
                 outline,
+                flash,
+                ..Quad::new(displaced(content).model(), image.texture)
             },
         ));
+        // Bullet holes, drawn just after the window so they sit on it.
+        quads.extend(
+            shards::holes(&displaced(content), &entry.damage, scene.hole_texture())
+                .into_iter()
+                .map(|hole| (distance - 1e-3, hole)),
+        );
     }
+    quads.extend(shards::quads(corpses, camera));
 
     // Farthest first, so that a translucent panel blends over what is behind it.
     quads.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -143,6 +161,7 @@ pub fn render_world(
 pub struct Presenter {
     world_id: Id,
     crosshair_ids: [Id; 4],
+    weapon: WeaponPainter,
     damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
 }
 
@@ -151,6 +170,7 @@ impl Presenter {
         Self {
             world_id: Id::new(),
             crosshair_ids: std::array::from_fn(|_| Id::new()),
+            weapon: WeaponPainter::new(),
             damage_tracker: None,
         }
     }
@@ -230,6 +250,15 @@ impl Presenter {
                     Kind::Unspecified,
                 )));
             }
+        }
+
+        if let Some(view) = overlays.weapon {
+            elements.extend(
+                self.weapon
+                    .elements(size, view)
+                    .into_iter()
+                    .map(OutputElement::Overlay),
+            );
         }
 
         elements.push(OutputElement::World(

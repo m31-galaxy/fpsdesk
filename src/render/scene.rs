@@ -7,7 +7,9 @@
 
 use std::error::Error;
 
-use glam::{Mat4, Quat, Vec3};
+use std::f32::consts::TAU;
+
+use glam::{Mat4, Quat, Vec2, Vec3};
 use smithay::{
     backend::renderer::gles::{
         GlesRenderer, GlesTexture,
@@ -34,9 +36,11 @@ const QUAD_VERTEX: &str = "#version 300 es
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_uv;
 uniform mat4 u_mvp;
+// The part of the texture to show: offset (xy) and size (zw).
+uniform vec4 u_uv;
 out vec2 v_uv;
 void main() {
-    v_uv = a_uv;
+    v_uv = u_uv.xy + a_uv * u_uv.zw;
     gl_Position = u_mvp * vec4(a_position, 0.0, 1.0);
 }
 ";
@@ -46,9 +50,13 @@ precision highp float;
 in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform vec4 u_tint;
+// Colour added over the opaque parts, for flashes.
+uniform vec3 u_flash;
 out vec4 color;
 void main() {
-    color = texture(u_texture, v_uv) * u_tint;
+    vec4 c = texture(u_texture, v_uv) * u_tint;
+    c.rgb += u_flash * c.a;
+    color = c;
 }
 ";
 
@@ -139,6 +147,27 @@ pub struct Quad {
     /// A border to draw around the quad: the placement of a slightly larger
     /// rectangle in the same plane, and its colour.
     pub outline: Option<(Mat4, [f32; 3])>,
+    /// The part of the texture to show: x, y, width and height as fractions
+    /// of it, measured from the top-left corner.
+    pub uv_rect: [f32; 4],
+    /// Multiplies the premultiplied texture colour: `[a; 4]` fades it by `a`.
+    pub tint: [f32; 4],
+    /// Colour added over the opaque parts, for flashes.
+    pub flash: [f32; 3],
+}
+
+impl Quad {
+    /// All of `texture` on the quad placed by `model`, drawn plainly.
+    pub fn new(model: Mat4, texture: u32) -> Self {
+        Self {
+            model,
+            texture,
+            outline: None,
+            uv_rect: [0.0, 0.0, 1.0, 1.0],
+            tint: [1.0; 4],
+            flash: [0.0; 3],
+        }
+    }
 }
 
 struct QuadProgram {
@@ -146,6 +175,8 @@ struct QuadProgram {
     u_mvp: i32,
     u_texture: i32,
     u_tint: i32,
+    u_uv: i32,
+    u_flash: i32,
 }
 
 struct SkyProgram {
@@ -174,6 +205,8 @@ pub struct SceneRenderer {
     vao: u32,
     /// A single white texel, for drawing plain colours with the quad program.
     white: u32,
+    /// A bullet hole, in premultiplied RGBA.
+    hole: u32,
     target: Option<Target>,
 }
 
@@ -210,6 +243,8 @@ impl SceneRenderer {
                 u_mvp: uniform(program, c"u_mvp"),
                 u_texture: uniform(program, c"u_texture"),
                 u_tint: uniform(program, c"u_tint"),
+                u_uv: uniform(program, c"u_uv"),
+                u_flash: uniform(program, c"u_flash"),
             };
 
             let program = gl::link_program(gl, SKY_VERTEX, SKY_FRAGMENT)?;
@@ -285,15 +320,45 @@ impl SceneRenderer {
             );
             gl.BindTexture(ffi::TEXTURE_2D, 0);
 
+            let mut hole = 0;
+            gl.GenTextures(1, &mut hole);
+            gl.BindTexture(ffi::TEXTURE_2D, hole);
+            gl.TexImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                ffi::RGBA8 as i32,
+                HOLE_PIXELS as i32,
+                HOLE_PIXELS as i32,
+                0,
+                ffi::RGBA,
+                ffi::UNSIGNED_BYTE,
+                bullet_hole().as_ptr().cast(),
+            );
+            for (parameter, value) in [
+                (ffi::TEXTURE_MIN_FILTER, ffi::LINEAR),
+                (ffi::TEXTURE_MAG_FILTER, ffi::LINEAR),
+                (ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE),
+                (ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE),
+            ] {
+                gl.TexParameteri(ffi::TEXTURE_2D, parameter, value as i32);
+            }
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+
             Ok(Self {
                 quad,
                 sky,
                 ground,
                 vao,
                 white,
+                hole,
                 target: None,
             })
         })?
+    }
+
+    /// GL name of the bullet hole texture.
+    pub fn hole_texture(&self) -> u32 {
+        self.hole
     }
 
     /// Draw the sky, the ground and `quads` (already ordered back to front) as
@@ -388,19 +453,26 @@ impl SceneRenderer {
             gl.Uniform1i(quad_program.u_texture, 0);
 
             for quad in quads {
+                gl.Uniform3f(quad_program.u_flash, 0.0, 0.0, 0.0);
                 if let Some((model, [r, g, b])) = quad.outline {
                     // The outline is in the same plane as its quad. Leaving it
                     // out of the depth buffer lets the quad draw over it.
                     gl.DepthMask(ffi::FALSE);
                     set_mat4(gl, quad_program.u_mvp, view_projection * model);
                     gl.Uniform4f(quad_program.u_tint, r, g, b, 1.0);
+                    gl.Uniform4f(quad_program.u_uv, 0.0, 0.0, 1.0, 1.0);
                     gl.BindTexture(ffi::TEXTURE_2D, self.white);
                     gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
                     gl.DepthMask(ffi::TRUE);
                 }
 
                 set_mat4(gl, quad_program.u_mvp, view_projection * quad.model);
-                gl.Uniform4f(quad_program.u_tint, 1.0, 1.0, 1.0, 1.0);
+                let [t0, t1, t2, t3] = quad.tint;
+                gl.Uniform4f(quad_program.u_tint, t0, t1, t2, t3);
+                let [x, y, w, h] = quad.uv_rect;
+                gl.Uniform4f(quad_program.u_uv, x, y, w, h);
+                let [r, g, b] = quad.flash;
+                gl.Uniform3f(quad_program.u_flash, r, g, b);
                 gl.BindTexture(ffi::TEXTURE_2D, quad.texture);
                 gl.DrawArrays(ffi::TRIANGLE_STRIP, 0, 4);
             }
@@ -521,5 +593,61 @@ impl Target {
         })?;
         // Dropping `self.color` hands the texture back to Smithay to delete.
         Ok(())
+    }
+}
+
+/// Side of the bullet hole's texture, in texels.
+const HOLE_PIXELS: usize = 48;
+
+/// A bullet hole drawn in code: a ragged dark crater, a scorched halo and a
+/// few cracks running out of it. Premultiplied RGBA, first row at the top.
+fn bullet_hole() -> Vec<u8> {
+    let mut pixels = vec![0u8; HOLE_PIXELS * HOLE_PIXELS * 4];
+    let half = HOLE_PIXELS as f32 / 2.0;
+    for y in 0..HOLE_PIXELS {
+        for x in 0..HOLE_PIXELS {
+            let p = Vec2::new(x as f32 + 0.5 - half, y as f32 + 0.5 - half) / half;
+            let r = p.length();
+            let angle = p.y.atan2(p.x);
+
+            // A crater whose edge wobbles, so it is not a perfect circle.
+            let crater = 0.30 + 0.05 * (5.0 * angle + 1.0).sin() + 0.04 * (9.0 * angle).sin();
+            let mut alpha = 0.0f32;
+            if r < crater {
+                alpha = 1.0;
+            } else if r < crater + 0.22 {
+                // Scorching, fading outwards.
+                alpha = 0.6 * (1.0 - (r - crater) / 0.22);
+            }
+            // Cracks along a handful of uneven spokes.
+            for spoke in 0..7 {
+                let direction = spoke as f32 * TAU / 7.0 + 0.4 * (spoke as f32 * 2.3).sin();
+                let reach = 0.55 + 0.4 * ((spoke as f32 * 1.7).cos() * 0.5 + 0.5);
+                let along = p.dot(Vec2::from_angle(direction));
+                let across = p.perp_dot(Vec2::from_angle(direction)).abs();
+                if along > 0.0 && r < reach && across < 0.03 * (1.0 - r / reach) + 0.008 {
+                    alpha = alpha.max(0.8 * (1.0 - r / reach));
+                }
+            }
+            // Nearly black, premultiplied (the colour is scaled by the alpha).
+            let value = (0.03 * alpha * 255.0) as u8;
+            let i = (y * HOLE_PIXELS + x) * 4;
+            pixels[i..i + 4].copy_from_slice(&[value, value, value, (alpha * 255.0) as u8]);
+        }
+    }
+    pixels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bullet_hole_is_dark_in_the_middle_and_clear_at_the_corners() {
+        let pixels = bullet_hole();
+        let alpha = |x: usize, y: usize| pixels[(y * HOLE_PIXELS + x) * 4 + 3];
+        assert_eq!(alpha(HOLE_PIXELS / 2, HOLE_PIXELS / 2), 255);
+        assert_eq!(alpha(0, 0), 0);
+        assert_eq!(alpha(HOLE_PIXELS - 1, HOLE_PIXELS - 1), 0);
     }
 }

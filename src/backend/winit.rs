@@ -176,6 +176,7 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
         state.backend.renderer(),
         &mut state.scene,
         &mut state.windows,
+        &state.shooting.corpses,
         &state.camera,
         size,
         scale,
@@ -186,6 +187,7 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
         // Cloned so that it does not hold a borrow of `state` across `bind`.
         let cursor_surface = state.cursor_surface().cloned();
         let overlays = Overlays {
+            weapon: state.weapon_view(),
             crosshair: state.mode == ControlMode::Walk,
             cursor: cursor_surface.as_ref().map(|surface| CursorSprite {
                 surface,

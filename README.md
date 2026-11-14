@@ -37,13 +37,14 @@ Walk mode, with a crosshair in the middle of the view:
 | Shift | Run |
 | Mouse | Look around |
 | Left click, Enter | Focus the window under the crosshair (outlined in blue) and switch to interact mode |
+| Right click | Shoot the window under the crosshair. It flashes red and gets a bullet hole that stays 10 seconds, then fades over 8 more. A third hit while two holes still show asks the window to close (it may refuse, or ask to save first); if it does close, it shatters |
 
 Interact mode, with a mouse cursor:
 
 | | |
 | --- | --- |
 | Keyboard | Goes to the focused window (outlined in amber) |
-| Mouse | Clicks, drags and scrolls whatever window is under the cursor; clicking a window focuses it |
+| Mouse | Clicks, drags and scrolls whatever window is under the cursor (right click opens context menus; it does not shoot); clicking a window focuses it |
 | Click on nothing | Back to walk mode, like Ctrl+Escape |
 
 Super also switches modes, but a host desktop normally keeps that key for
@@ -62,7 +63,8 @@ scripts/headless-run cargo run -- --smoke -c foot \
     --script "wait 20; use; key 35; key 23; wait 20" --screenshot /tmp/fpsdesk.png
 ```
 
-- `--smoke` exits 0 once a client window has been drawn for 60 frames, or 1
+- `--smoke` exits 0 once a client window has been drawn for 60 frames (or
+  `--smoke-frames N`, to catch a short animation), or 1
   after ten seconds.
 - `--script` plays input back through the same code paths as real devices:
   here it focuses the terminal and types "hi". The steps are listed at the top

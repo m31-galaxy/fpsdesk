@@ -8,6 +8,7 @@ mod handlers;
 mod input;
 mod render;
 mod script;
+mod shooting;
 mod state;
 mod world;
 
@@ -28,7 +29,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     script::Script,
-    state::{Smoke, State},
+    state::{SMOKE_FRAMES, Smoke, State},
     world::{Camera, EYE_HEIGHT},
 };
 
@@ -39,6 +40,8 @@ Options:
   -c, --command <CMD>      Run CMD (through sh) as a client once started; repeatable
       --smoke              Self-test: exit 0 after 60 frames, or exit 1 after 10 s.
                            With -c, frames only count once a client window is shown
+      --smoke-frames <N>   With --smoke: frames to render after the script ends
+                           before passing and taking the screenshot (default 60)
       --screenshot <PATH>  With --smoke: save the last frame to PATH as a PNG
       --script <STEPS>     Play scripted input, one step a frame; see src/script.rs
       --camera <X,Z,YAW,PITCH>
@@ -49,6 +52,7 @@ Options:
 Controls:
   Walk mode      W/A/S/D or arrows move, Shift runs, the mouse looks around.
                  Left click or Enter uses the window under the crosshair.
+                 Right click shoots it, asking it to close.
   Interact mode  Keys go to the focused window.
   Either         Ctrl+Escape (or Super) switches between the two modes.";
 
@@ -57,6 +61,7 @@ const SMOKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Args {
     smoke: bool,
+    smoke_frames: u32,
     screenshot: Option<PathBuf>,
     camera: Option<[f32; 4]>,
     script: Option<String>,
@@ -66,6 +71,7 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut parsed = Args {
         smoke: false,
+        smoke_frames: SMOKE_FRAMES,
         screenshot: None,
         camera: None,
         script: None,
@@ -75,6 +81,10 @@ fn parse_args() -> Result<Args, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--smoke" => parsed.smoke = true,
+            "--smoke-frames" => {
+                let frames = args.next().and_then(|n| n.parse().ok());
+                parsed.smoke_frames = frames.ok_or("--smoke-frames needs a number")?;
+            }
             "--screenshot" => {
                 let path = args.next().ok_or("--screenshot needs a path")?;
                 parsed.screenshot = Some(path.into());
@@ -143,6 +153,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             needs_window: !args.commands.is_empty(),
             frames: 0,
             passed: false,
+            frames_needed: args.smoke_frames,
             screenshot: args.screenshot.clone(),
         });
         event_loop
