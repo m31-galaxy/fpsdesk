@@ -6,26 +6,24 @@
 use std::{error::Error, time::Duration};
 
 use smithay::{
-    backend::{
-        renderer::{
-            Color32F, damage::OutputDamageTracker, element::surface::WaylandSurfaceRenderElement,
-            gles::GlesRenderer,
-        },
-        winit::{WinitEvent, WinitEventLoop},
-    },
-    desktop::space::render_output,
+    backend::winit::{WinitEvent, WinitEventLoop},
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::calloop::EventLoop,
     utils::{Rectangle, Transform},
 };
-use tracing::error;
+use tracing::{error, info};
 
-use crate::state::State;
-
-const CLEAR_COLOR: Color32F = Color32F::new(0.05, 0.07, 0.12, 1.0);
+use crate::{
+    render::{self, Presenter, screenshot},
+    state::State,
+};
 
 /// The host does not tell us its refresh rate; advertise 60 Hz to clients.
 const REFRESH_MHZ: i32 = 60_000;
+
+/// GL puts a window surface's origin at the bottom left, so what we draw is
+/// upside down relative to how the output is described to clients.
+const OUTPUT_TRANSFORM: Transform = Transform::Flipped180;
 
 /// Create the output for the nested window and start handling its events.
 pub fn init(
@@ -51,19 +49,18 @@ pub fn init(
         size: state.backend.window_size(),
         refresh: REFRESH_MHZ,
     };
-    // GL's framebuffer origin is bottom-left, hence the flip. Matching the
-    // host's scale keeps clients sharp on a HiDPI display.
+    // Matching the host's scale keeps clients sharp on a HiDPI display.
     let scale = Scale::Fractional(state.backend.window().scale_factor());
     output.change_current_state(
         Some(mode),
-        Some(Transform::Flipped180),
+        Some(OUTPUT_TRANSFORM),
         Some(scale),
         Some((0, 0).into()),
     );
     output.set_preferred(mode);
-    state.space.map_output(&output, (0, 0));
+    state.outputs.push(output.clone());
 
-    let mut damage_tracker = OutputDamageTracker::from_output(&output);
+    let mut presenter = Presenter::new();
 
     event_loop
         .handle()
@@ -82,7 +79,7 @@ pub fn init(
             }
             WinitEvent::Input(event) => state.process_input_event(event),
             WinitEvent::Redraw => {
-                if let Err(err) = redraw(state, &output, &mut damage_tracker) {
+                if let Err(err) = redraw(state, &output, &mut presenter) {
                     error!(%err, "rendering failed");
                     state.loop_signal.stop();
                 }
@@ -97,41 +94,45 @@ pub fn init(
 fn redraw(
     state: &mut State,
     output: &Output,
-    damage_tracker: &mut OutputDamageTracker,
+    presenter: &mut Presenter,
 ) -> Result<(), Box<dyn Error>> {
-    let damage = Rectangle::from_size(state.backend.window_size());
+    let size = state.backend.window_size();
+    let scale = output.current_scale().fractional_scale();
 
+    let world = render::render_world(
+        state.backend.renderer(),
+        &mut state.scene,
+        &mut state.windows,
+        &state.camera,
+        size,
+        scale,
+    )?;
+
+    let smoke_finished = state.smoke_frame_rendered();
     {
         let (renderer, mut framebuffer) = state.backend.bind()?;
-        // Buffer age 0: redraw everything each frame. Damage tracking is not
-        // worth having until the 3D pipeline settles what a frame is.
-        render_output::<_, WaylandSurfaceRenderElement<GlesRenderer>, _, _>(
-            output,
-            renderer,
-            &mut framebuffer,
-            1.0,
-            0,
-            [&state.space],
-            &[],
-            damage_tracker,
-            CLEAR_COLOR,
-        )?;
+        presenter.present(renderer, &mut framebuffer, size, OUTPUT_TRANSFORM, world)?;
+
+        let screenshot = state.smoke.as_ref().and_then(|s| s.screenshot.as_deref());
+        if smoke_finished && let Some(path) = screenshot {
+            screenshot::save(renderer, &mut framebuffer, size, path)?;
+            info!(?path, "saved screenshot");
+        }
     }
-    state.backend.submit(Some(&[damage]))?;
+    state.backend.submit(Some(&[Rectangle::from_size(size)]))?;
 
     // Tell clients the frame is on screen so they draw their next one.
     let elapsed = state.start_time.elapsed();
-    for window in state.space.elements() {
-        window.send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
-            Some(output.clone())
-        });
+    for entry in &state.windows {
+        entry
+            .window
+            .send_frame(output, elapsed, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
     }
 
-    state.space.refresh();
-    state.popups.cleanup();
+    state.refresh();
     state.display_handle.flush_clients()?;
-
-    state.smoke_frame_rendered();
 
     // Redraw continuously; the host throttles us to its refresh rate.
     state.backend.window().request_redraw();

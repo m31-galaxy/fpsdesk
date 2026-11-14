@@ -7,6 +7,8 @@ description = "A Wayland compositor navigable in first-person 3D"
 publish = false
 
 [dependencies]
+glam = "0.34.3"
+png = "0.18.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

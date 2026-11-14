@@ -1,11 +1,13 @@
 //! Compositor state: the Smithay protocol states, the seat, and the windows.
 
-use std::{ffi::OsString, sync::Arc, time::Instant};
+use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Instant};
 
+use glam::Vec3;
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Window, space::SpaceElement},
     input::{Seat, SeatState},
+    output::Output,
     reexports::{
         calloop::{EventLoop, Interest, LoopSignal, Mode, PostAction, generic::Generic},
         wayland_server::{
@@ -14,7 +16,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER},
+    utils::{IsAlive, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -26,7 +28,21 @@ use smithay::{
     },
 };
 
-use crate::handlers;
+use crate::{
+    handlers,
+    render::{scene::SceneRenderer, window::WindowTexture},
+    world::{self, Camera, EYE_HEIGHT, Panel},
+};
+
+/// A client window and its place in the world.
+pub struct WindowEntry {
+    pub window: Window,
+    /// Which `world::arc_slot` the window occupies.
+    pub slot: usize,
+    pub panel: Panel,
+    /// The window's flattened picture; `None` until it first has content.
+    pub texture: Option<WindowTexture>,
+}
 
 /// Bookkeeping for `--smoke` runs. See `main.rs`.
 pub struct Smoke {
@@ -34,6 +50,8 @@ pub struct Smoke {
     pub needs_window: bool,
     pub frames: u32,
     pub passed: bool,
+    /// Where to save the final frame, if anywhere.
+    pub screenshot: Option<PathBuf>,
 }
 
 pub struct State {
@@ -44,9 +62,12 @@ pub struct State {
 
     /// The nested window we render into, and the GL renderer that owns its context.
     pub backend: WinitGraphicsBackend<GlesRenderer>,
+    pub scene: SceneRenderer,
+    /// Outputs the backend has created.
+    pub outputs: Vec<Output>,
 
-    /// Flat 2D arrangement of windows. Replaced by the 3D world in M2.
-    pub space: Space<Window>,
+    pub camera: Camera,
+    pub windows: Vec<WindowEntry>,
     pub popups: PopupManager,
 
     pub compositor_state: CompositorState,
@@ -85,6 +106,15 @@ impl State {
         seat.add_keyboard(Default::default(), 200, 25)?;
         seat.add_pointer();
 
+        let scene = SceneRenderer::new(backend.renderer())?;
+
+        // Fixed until M3 adds movement. Windows are arranged around the
+        // origin; standing off to one side shows them in perspective.
+        let camera = Camera::looking_at(
+            Vec3::new(0.5, EYE_HEIGHT, 0.6),
+            Vec3::new(0.35, EYE_HEIGHT, -1.5),
+        );
+
         let socket_name = Self::listen(display, event_loop)?;
 
         Ok(Self {
@@ -93,7 +123,10 @@ impl State {
             display_handle: dh,
             loop_signal: event_loop.get_signal(),
             backend,
-            space: Space::default(),
+            scene,
+            outputs: Vec::new(),
+            camera,
+            windows: Vec::new(),
             popups: PopupManager::default(),
             compositor_state,
             xdg_shell_state,
@@ -140,52 +173,77 @@ impl State {
 
     /// The window whose toplevel surface is `surface`, if any.
     pub fn window_for_toplevel(&self, surface: &WlSurface) -> Option<&Window> {
-        self.space
-            .elements()
+        self.windows
+            .iter()
+            .map(|entry| &entry.window)
             .find(|window| window.toplevel().is_some_and(|t| t.wl_surface() == surface))
     }
 
-    /// The surface (toplevel, subsurface or popup) under a point in the space,
-    /// together with that surface's origin in space coordinates.
-    pub fn surface_under(
-        &self,
-        pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        let (window, location) = self.space.element_under(pos)?;
-        let (surface, offset) =
-            window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)?;
-        Some((surface, (offset + location).to_f64()))
+    /// Start managing a new window: give it a place in the world and focus it.
+    pub fn add_window(&mut self, window: Window) {
+        let slot = (0..)
+            .find(|slot| self.windows.iter().all(|entry| entry.slot != *slot))
+            .expect("there is always a free slot");
+        self.windows.push(WindowEntry {
+            window: window.clone(),
+            slot,
+            panel: world::arc_slot(slot),
+            texture: None,
+        });
+        self.focus_window(Some(&window));
     }
 
-    /// Give keyboard focus to `window` and raise it, or clear focus with `None`.
+    /// Give keyboard focus to `window`, or clear focus with `None`.
     pub fn focus_window(&mut self, window: Option<&Window>) {
         let serial = SERIAL_COUNTER.next_serial();
         let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
 
-        match window {
-            Some(window) => {
-                // Raising with `activate` also deactivates every other window.
-                self.space.raise_element(window, true);
-                let surface = window.toplevel().map(|t| t.wl_surface().clone());
-                keyboard.set_focus(self, surface, serial);
-            }
-            None => {
-                for window in self.space.elements() {
-                    window.set_activated(false);
-                }
-                keyboard.set_focus(self, None, serial);
-            }
+        for entry in &self.windows {
+            entry.window.set_activated(Some(&entry.window) == window);
         }
+        let surface = window
+            .and_then(|window| window.toplevel())
+            .map(|toplevel| toplevel.wl_surface().clone());
+        keyboard.set_focus(self, surface, serial);
 
         // Tell clients whose activated state just changed. Windows that have not
         // had their initial configure yet get this state with it instead.
-        for window in self.space.elements() {
-            if let Some(toplevel) = window.toplevel()
+        for entry in &self.windows {
+            if let Some(toplevel) = entry.window.toplevel()
                 && toplevel.is_initial_configure_sent()
             {
                 toplevel.send_pending_configure();
             }
         }
+    }
+
+    /// Per-frame housekeeping: forget closed windows and keep the rest
+    /// informed about the output they are shown on.
+    pub fn refresh(&mut self) {
+        let count = self.windows.len();
+        self.windows.retain(|entry| entry.window.alive());
+
+        // Until there is a way to pick a window, typing would be stuck once
+        // the focused window closes; hand focus to the newest one left.
+        if self.windows.len() != count {
+            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+            let focus = keyboard.current_focus();
+            let focus_remains = focus.is_some_and(|s| self.window_for_toplevel(&s).is_some());
+            if !focus_remains {
+                let newest = self.windows.last().map(|entry| entry.window.clone());
+                self.focus_window(newest.as_ref());
+            }
+        }
+
+        for entry in &self.windows {
+            // Every window counts as fully on every output, wherever its panel
+            // is: this is what tells clients which scale to draw at.
+            for output in &self.outputs {
+                entry.window.output_enter(output, entry.window.bbox());
+            }
+            entry.window.refresh();
+        }
+        self.popups.cleanup();
     }
 }
 
@@ -193,23 +251,26 @@ impl State {
 const SMOKE_FRAMES: u32 = 60;
 
 impl State {
-    /// Count a rendered frame towards the smoke test and stop once it passes.
-    pub fn smoke_frame_rendered(&mut self) {
+    /// Count a rendered frame towards the smoke test. Returns true for the
+    /// frame that completes it, and stops the event loop.
+    pub fn smoke_frame_rendered(&mut self) -> bool {
         let Some(smoke) = self.smoke.as_mut() else {
-            return;
+            return false;
         };
-        // A window only has a bounding box once its client attached a buffer.
-        let window_shown = self.space.elements().any(|w| !w.bbox().is_empty());
-        if smoke.needs_window && !window_shown {
-            return;
+        // A window gets its texture the first time it is drawn into the world.
+        let window_shown = self.windows.iter().any(|entry| entry.texture.is_some());
+        if smoke.passed || (smoke.needs_window && !window_shown) {
+            return false;
         }
 
         smoke.frames += 1;
-        if smoke.frames >= SMOKE_FRAMES && !smoke.passed {
-            smoke.passed = true;
-            tracing::info!(frames = smoke.frames, "smoke test passed");
-            self.loop_signal.stop();
+        if smoke.frames < SMOKE_FRAMES {
+            return false;
         }
+        smoke.passed = true;
+        tracing::info!(frames = smoke.frames, "smoke test passed");
+        self.loop_signal.stop();
+        true
     }
 }
 

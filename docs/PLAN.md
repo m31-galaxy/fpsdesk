@@ -3,9 +3,9 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0 done. M1 implemented**: shm and dmabuf clients connect and are
-shown (checked by `--smoke`), but typing and clicking still need a hands-on
-check. Next up is M2.
+Status: **M0, M1 and M2 done.** Windows are drawn on panels in a 3D scene seen
+from a fixed camera. The pointer is not routed to clients until ray picking
+exists; keys go to the newest window. Next up is M3.
 
 ## Decisions
 
@@ -191,8 +191,14 @@ whatever using it day to day shows up.
    within. Plan: popups are extra quads in the parent's plane, constrained to a
    generous virtual rectangle around the parent.
 6. **Performance on integrated graphics.** Regenerating mipmaps for large,
-   busy windows each frame may be costly at 120 Hz on a high-DPI panel. Measure
-   in M2; fall-backs are throttled mipmap updates and a lower world resolution.
+   busy windows each frame may be costly at 120 Hz on a high-DPI panel. Not
+   measured yet: do it in M3, once there is a frame-time readout. Fall-backs
+   are throttled mipmap updates and a lower world resolution.
+7. **Nested mode stalls when hidden.** The nested backend redraws only when
+   the host asks for a frame, and a desktop stops asking while the window is
+   hidden or the screen is locked, which also freezes the clients inside.
+   Harmless for development, but automated checks must run under
+   `scripts/headless-run`. The DRM backend paces itself and is unaffected.
 
 ## Working with upstream
 

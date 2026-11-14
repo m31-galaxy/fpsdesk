@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Run a command with a headless Weston as the host Wayland session.
+#
+# FPSDesk's nested backend only draws when its host asks for frames, and a
+# desktop stops asking when the window is hidden or the screen is locked. A
+# headless host always asks, shows nothing on the real screen, and gives the
+# nested window a fixed size.
+#
+#   scripts/headless-run cargo run -- --smoke -c foot --screenshot /tmp/shot.png
+#
+# Needs weston on PATH (the Nix dev shell provides it).
+set -euo pipefail
+
+socket="fpsdesk-host-$$"
+log="$(mktemp)"
+
+weston --backend=headless --renderer=gl --socket="$socket" \
+    --width=1600 --height=1000 --idle-time=0 >"$log" 2>&1 &
+weston_pid=$!
+trap 'kill "$weston_pid" 2>/dev/null || true; rm -f "$log"' EXIT
+
+for _ in $(seq 50); do
+    [ -S "${XDG_RUNTIME_DIR}/${socket}" ] && break
+    if ! kill -0 "$weston_pid" 2>/dev/null; then
+        echo "headless-run: weston failed to start:" >&2
+        cat "$log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+
+WAYLAND_DISPLAY="$socket" "$@"

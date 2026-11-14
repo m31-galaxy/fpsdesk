@@ -1,7 +1,7 @@
 use smithay::{
     desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
     reexports::wayland_server::protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
-    utils::Serial,
+    utils::{Rectangle, Serial},
     wayland::shell::xdg::{
         PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     },
@@ -10,25 +10,14 @@ use tracing::info;
 
 use crate::state::State;
 
-/// New windows are offset from the previous one by this much, wrapping after
-/// `CASCADE_STEPS`, so that they do not land exactly on top of each other.
-const CASCADE_OFFSET: i32 = 32;
-const CASCADE_STEPS: i32 = 8;
-
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
         &mut self.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        let step = self.space.elements().count() as i32 % CASCADE_STEPS;
-        let offset = CASCADE_OFFSET * step;
-
-        let window = Window::new_wayland_window(surface);
-        self.space
-            .map_element(window.clone(), (offset, offset), false);
-        self.focus_window(Some(&window));
-        info!(windows = self.space.elements().count(), "new window");
+        self.add_window(Window::new_wayland_window(surface));
+        info!(windows = self.windows.len(), "new window");
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -81,7 +70,11 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
 }
 
 impl State {
-    /// Adjust a popup's position so that it stays within the output.
+    /// Adjust a popup's position so that it stays within its window.
+    ///
+    /// There is no screen edge to keep a popup away from in 3D, but for now a
+    /// window's texture only covers the window itself, so anything outside it
+    /// would not be drawn. M4 gives popups panels of their own.
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let kind = PopupKind::Xdg(popup.clone());
         let Ok(root) = find_popup_root_surface(&kind) else {
@@ -90,23 +83,11 @@ impl State {
         let Some(window) = self.window_for_toplevel(&root) else {
             return;
         };
-        let Some(output_geo) = self
-            .space
-            .outputs()
-            .next()
-            .and_then(|output| self.space.output_geometry(output))
-        else {
-            return;
-        };
-        let Some(window_geo) = self.space.element_geometry(window) else {
-            return;
-        };
 
         // The positioner works relative to the popup's parent, so express the
-        // output rectangle in those coordinates.
-        let mut target = output_geo;
+        // window's rectangle in those coordinates.
+        let mut target = Rectangle::from_size(window.geometry().size);
         target.loc -= get_popup_toplevel_coords(&kind);
-        target.loc -= window_geo.loc;
 
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
