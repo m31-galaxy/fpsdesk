@@ -439,6 +439,8 @@ impl State {
         info!(focused = window.is_some(), "interact mode");
         self.mode = Mode::Interact;
         self.move_keys.release_all();
+        // The launcher belongs to walk mode; clicking a window dismisses it.
+        self.prompt.close();
         self.look_motion = Vec2::ZERO;
         self.focus_window(window.as_ref());
 
