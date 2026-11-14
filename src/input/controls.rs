@@ -16,6 +16,8 @@ pub enum Mode {
 /// under the same fingers whatever the layout.
 pub mod key {
     pub const ENTER: u32 = 28;
+    pub const GRAVE: u32 = 41;
+    pub const SLASH: u32 = 53;
     pub const W: u32 = 17;
     pub const A: u32 = 30;
     pub const S: u32 = 31;

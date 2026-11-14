@@ -17,18 +17,23 @@ use std::error::Error;
 
 use glam::Vec2;
 use smithay::{
-    backend::renderer::{
-        Color32F, Renderer,
-        damage::OutputDamageTracker,
-        element::{
-            Id, Kind, render_elements,
-            solid::SolidColorRenderElement,
-            surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
-            texture::TextureRenderElement,
-            utils::RescaleRenderElement,
+    backend::{
+        allocator::Fourcc,
+        renderer::{
+            Color32F, Renderer,
+            damage::OutputDamageTracker,
+            element::{
+                Id, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                render_elements,
+                solid::SolidColorRenderElement,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                texture::TextureRenderElement,
+                utils::RescaleRenderElement,
+            },
+            gles::{GlesRenderer, GlesTarget, GlesTexture},
+            utils::CommitCounter,
         },
-        gles::{GlesRenderer, GlesTarget, GlesTexture},
-        utils::CommitCounter,
     },
     input::pointer::CursorImageSurfaceData,
     reexports::wayland_server::protocol::wl_surface::WlSurface,
@@ -37,6 +42,7 @@ use smithay::{
 };
 
 use crate::{
+    prompt::Prompt,
     state::{Highlight, WindowEntry},
     world::{Camera, PIXELS_PER_METRE, Panel},
 };
@@ -60,16 +66,40 @@ render_elements! {
     World=TextureRenderElement<GlesTexture>,
     Overlay=SolidColorRenderElement,
     Cursor=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+    Text=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
 /// What pass 3 draws over the world.
 #[derive(Default)]
 pub struct Overlays<'a> {
+    /// The launcher prompt, when open.
+    pub prompt: Option<PromptSprite<'a>>,
     /// A crosshair in the middle of the view.
     pub crosshair: bool,
     /// A client's cursor image.
     pub cursor: Option<CursorSprite<'a>>,
 }
+
+/// The launcher prompt and how big to draw it.
+pub struct PromptSprite<'a> {
+    pub prompt: &'a Prompt,
+    /// Output pixels per logical pixel.
+    pub scale: f64,
+}
+
+/// The prompt's picture as last drawn, and what it was drawn from.
+struct PromptImage {
+    text: String,
+    width: u32,
+    text_scale: u32,
+    buffer: MemoryRenderBuffer,
+}
+
+/// Font pixels are this many times the output scale (rounded to a whole
+/// number) across, since the 8x8 font is tiny at 1.
+const PROMPT_FONT_SCALE: u32 = 2;
+/// Gap between the prompt bar and the edges of the view, in text scale units.
+const PROMPT_MARGIN: i32 = 6;
 
 /// A cursor image supplied by a client, and where to draw it.
 pub struct CursorSprite<'a> {
@@ -143,6 +173,7 @@ pub fn render_world(
 pub struct Presenter {
     world_id: Id,
     crosshair_ids: [Id; 4],
+    prompt_image: Option<PromptImage>,
     damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
 }
 
@@ -151,6 +182,7 @@ impl Presenter {
         Self {
             world_id: Id::new(),
             crosshair_ids: std::array::from_fn(|_| Id::new()),
+            prompt_image: None,
             damage_tracker: None,
         }
     }
@@ -174,6 +206,46 @@ impl Presenter {
 
         // Front to back: the first element is drawn on top.
         let mut elements: Vec<OutputElement> = Vec::new();
+
+        if let Some(sprite) = overlays.prompt {
+            let text_scale = PROMPT_FONT_SCALE * (sprite.scale.round().max(1.0) as u32);
+            let margin = PROMPT_MARGIN * text_scale as i32;
+            let width = (size.w - 2 * margin).max(1) as u32;
+            let current = self.prompt_image.as_ref().is_some_and(|image| {
+                image.text == sprite.prompt.text()
+                    && image.width == width
+                    && image.text_scale == text_scale
+            });
+            if !current {
+                let bitmap = sprite.prompt.draw(width, text_scale);
+                self.prompt_image = Some(PromptImage {
+                    text: sprite.prompt.text().to_string(),
+                    width,
+                    text_scale,
+                    buffer: MemoryRenderBuffer::from_slice(
+                        &bitmap.pixels,
+                        Fourcc::Abgr8888,
+                        (bitmap.width as i32, bitmap.height as i32),
+                        1,
+                        Transform::Normal,
+                        None,
+                    ),
+                });
+            }
+            let image = self.prompt_image.as_ref().expect("just created");
+            let top = size.h - margin - Prompt::height(text_scale) as i32;
+            elements.push(OutputElement::Text(
+                MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    Point::<f64, Physical>::from((f64::from(margin), f64::from(top))),
+                    &image.buffer,
+                    None,
+                    None,
+                    None,
+                    Kind::Unspecified,
+                )?,
+            ));
+        }
 
         if let Some(cursor) = overlays.cursor {
             let hotspot = with_states(cursor.surface, |states| {

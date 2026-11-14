@@ -26,7 +26,7 @@ use super::relative_pointer::RelativePointer;
 use crate::{
     frame_stats::FrameStats,
     input::controls::Mode as ControlMode,
-    render::{self, CursorSprite, Overlays, Presenter, screenshot},
+    render::{self, CursorSprite, Overlays, Presenter, PromptSprite, screenshot},
     state::State,
 };
 
@@ -186,6 +186,10 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
         // Cloned so that it does not hold a borrow of `state` across `bind`.
         let cursor_surface = state.cursor_surface().cloned();
         let overlays = Overlays {
+            prompt: state.prompt.is_open().then_some(PromptSprite {
+                prompt: &state.prompt,
+                scale,
+            }),
             crosshair: state.mode == ControlMode::Walk,
             cursor: cursor_surface.as_ref().map(|surface| CursorSprite {
                 surface,

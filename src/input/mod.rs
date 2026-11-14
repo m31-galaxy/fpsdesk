@@ -10,6 +10,8 @@
 //!   Enter on the window under the crosshair focuses it and enters interact.
 //! - Interact: clicking a window focuses it; clicking on nothing returns to
 //!   walk mode.
+//! - Walk: the backtick or `/` key opens the launcher prompt, which takes every
+//!   key until Enter runs its command or Escape closes it.
 //! - Either mode: Super, or Ctrl+Escape, switches to the other mode. (Under a
 //!   host desktop Super usually never reaches us, hence the second binding.)
 //!
@@ -36,6 +38,8 @@ use smithay::{
 use tracing::info;
 
 use crate::{
+    launch::spawn_client,
+    prompt::{PromptEvent, PromptKey},
     state::{Highlight, State, WindowEntry},
     world::{self, Ray},
 };
@@ -52,6 +56,26 @@ enum KeyAction {
     ToggleMode,
     /// A key that means something in walk mode, or nothing at all.
     Walk,
+    /// Open the launcher prompt.
+    OpenPrompt,
+    /// A key for the open launcher prompt.
+    Prompt(PromptKey),
+}
+
+/// What an open prompt makes of a key press. `typing` is false while a
+/// shortcut modifier is held, so that Ctrl+C does not type a `c`.
+fn prompt_key(sym: Keysym, typing: bool) -> Option<PromptKey> {
+    match sym {
+        Keysym::BackSpace => Some(PromptKey::Backspace),
+        Keysym::Up => Some(PromptKey::Up),
+        Keysym::Down => Some(PromptKey::Down),
+        Keysym::Return | Keysym::KP_Enter => Some(PromptKey::Enter),
+        Keysym::Escape => Some(PromptKey::Escape),
+        _ => sym
+            .key_char()
+            .filter(|ch| typing && !ch.is_control())
+            .map(PromptKey::Char),
+    }
 }
 
 /// A point on a window, found by following a ray into the world.
@@ -152,11 +176,24 @@ impl State {
                 }
 
                 let sym = handle.modified_sym();
+                if state.prompt.is_open() {
+                    // Keys the prompt cannot use are swallowed too: nothing
+                    // may reach the world or a client while it is up.
+                    state.suppressed_keys.insert(keycode.raw());
+                    let typing = !(modifiers.ctrl || modifiers.alt || modifiers.logo);
+                    return FilterResult::Intercept(match prompt_key(sym, typing) {
+                        Some(key) => KeyAction::Prompt(key),
+                        None => KeyAction::Walk,
+                    });
+                }
                 let toggle = sym == Keysym::Super_L
                     || sym == Keysym::Super_R
                     || (sym == Keysym::Escape && modifiers.ctrl);
                 let action = if toggle {
                     KeyAction::ToggleMode
+                } else if state.mode == Mode::Walk && matches!(evdev_code, key::GRAVE | key::SLASH)
+                {
+                    KeyAction::OpenPrompt
                 } else if state.mode == Mode::Walk {
                     KeyAction::Walk
                 } else {
@@ -169,13 +206,27 @@ impl State {
 
         match action {
             Some(KeyAction::ToggleMode) => self.toggle_mode(),
+            Some(KeyAction::OpenPrompt) => {
+                self.move_keys.release_all();
+                self.prompt.open();
+            }
+            Some(KeyAction::Prompt(key)) => {
+                if let Some(PromptEvent::Run(command)) = self.prompt.key(key) {
+                    spawn_client(&command, &self.socket_name);
+                }
+            }
             Some(KeyAction::Walk) => {
                 // Releases always count, so a key held while leaving walk mode
-                // does not stay held.
-                if self.mode == Mode::Walk || !pressed {
+                // does not stay held. Neither does it move you while the
+                // prompt is up.
+                if (self.mode == Mode::Walk && !self.prompt.is_open()) || !pressed {
                     self.move_keys.set(evdev_code, pressed);
                 }
-                if pressed && evdev_code == key::ENTER && self.mode == Mode::Walk {
+                if pressed
+                    && evdev_code == key::ENTER
+                    && self.mode == Mode::Walk
+                    && !self.prompt.is_open()
+                {
                     self.use_hovered();
                 }
             }

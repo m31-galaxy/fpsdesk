@@ -31,6 +31,7 @@ use smithay::{
 use crate::{
     handlers,
     input::controls::{Mode, MoveKeys},
+    prompt::Prompt,
     render::{
         scene::SceneRenderer,
         window::{Extent, WindowTexture},
@@ -109,6 +110,8 @@ pub struct State {
     pub outputs: Vec<Output>,
 
     pub mode: Mode,
+    /// The launcher prompt. While it is open it takes every key.
+    pub prompt: Prompt,
     pub move_keys: MoveKeys,
     /// Pointer movement, in logical pixels, not yet applied to the camera.
     pub look_motion: Vec2,
@@ -195,6 +198,7 @@ impl State {
             scene,
             outputs: Vec::new(),
             mode: Mode::Walk,
+            prompt: Prompt::default(),
             move_keys: MoveKeys::default(),
             look_motion: Vec2::ZERO,
             has_relative_pointer: false,

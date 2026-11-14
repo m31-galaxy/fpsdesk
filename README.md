@@ -37,6 +37,12 @@ Walk mode, with a crosshair in the middle of the view:
 | Shift | Run |
 | Mouse | Look around |
 | Left click, Enter | Focus the window under the crosshair (outlined in blue) and switch to interact mode |
+| `, / | Open the launcher prompt at the bottom of the view |
+
+The launcher takes every key while it is open: type a command (run through
+`sh -c`, as a client of FPSDesk), Enter runs it, Backspace edits, Up and Down
+recall earlier commands, Escape closes it without running anything. It is not
+available in interact mode, where the keys belong to the application.
 
 Interact mode, with a mouse cursor:
 

@@ -6,12 +6,15 @@ mod backend;
 mod frame_stats;
 mod handlers;
 mod input;
+mod launch;
+mod prompt;
 mod render;
 mod script;
 mod state;
+mod text;
 mod world;
 
-use std::{error::Error, path::PathBuf, process::Command, time::Duration};
+use std::{error::Error, path::PathBuf, time::Duration};
 
 use glam::Vec3;
 use smithay::{
@@ -24,9 +27,10 @@ use smithay::{
         wayland_server::Display,
     },
 };
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::{
+    launch::spawn_client,
     script::Script,
     state::{Smoke, State},
     world::{Camera, EYE_HEIGHT},
@@ -49,6 +53,8 @@ Options:
 Controls:
   Walk mode      W/A/S/D or arrows move, Shift runs, the mouse looks around.
                  Left click or Enter uses the window under the crosshair.
+                 ` or / opens the launcher: type a command, Enter runs it,
+                 Up recalls the previous one, Escape cancels.
   Interact mode  Keys go to the focused window.
   Either         Ctrl+Escape (or Super) switches between the two modes.";
 
@@ -155,7 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     for command in &args.commands {
-        spawn_client(command, &state);
+        spawn_client(command, &state.socket_name);
     }
 
     event_loop.run(None, &mut state, |_| {})?;
@@ -163,22 +169,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     match state.smoke {
         Some(Smoke { passed: false, .. }) => Err("smoke test failed".into()),
         _ => Ok(()),
-    }
-}
-
-/// Start a client program connected to our Wayland socket.
-fn spawn_client(command: &str, state: &State) {
-    let result = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .env("WAYLAND_DISPLAY", &state.socket_name)
-        // Without this, toolkits can quietly fall back to the host's X server
-        // and open their window outside FPSDesk.
-        .env_remove("DISPLAY")
-        .spawn();
-    match result {
-        Ok(child) => info!(command, pid = child.id(), "spawned client"),
-        Err(err) => warn!(command, %err, "failed to spawn client"),
     }
 }
 
