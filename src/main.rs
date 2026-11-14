@@ -7,6 +7,7 @@ mod frame_stats;
 mod handlers;
 mod input;
 mod render;
+mod script;
 mod state;
 mod world;
 
@@ -26,6 +27,7 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use crate::{
+    script::Script,
     state::{Smoke, State},
     world::{Camera, EYE_HEIGHT},
 };
@@ -38,6 +40,7 @@ Options:
       --smoke              Self-test: exit 0 after 60 frames, or exit 1 after 10 s.
                            With -c, frames only count once a client window is shown
       --screenshot <PATH>  With --smoke: save the last frame to PATH as a PNG
+      --script <STEPS>     Play scripted input, one step a frame; see src/script.rs
       --camera <X,Z,YAW,PITCH>
                            Start X metres right of and Z metres behind the origin,
                            turned YAW degrees left and looking PITCH degrees up
@@ -56,6 +59,7 @@ struct Args {
     smoke: bool,
     screenshot: Option<PathBuf>,
     camera: Option<[f32; 4]>,
+    script: Option<String>,
     commands: Vec<String>,
 }
 
@@ -64,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         smoke: false,
         screenshot: None,
         camera: None,
+        script: None,
         commands: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
@@ -73,6 +78,9 @@ fn parse_args() -> Result<Args, String> {
             "--screenshot" => {
                 let path = args.next().ok_or("--screenshot needs a path")?;
                 parsed.screenshot = Some(path.into());
+            }
+            "--script" => {
+                parsed.script = Some(args.next().ok_or("--script needs a list of steps")?);
             }
             "--camera" => {
                 let pose = args.next().ok_or("--camera needs X,Z,YAW,PITCH")?;
@@ -120,6 +128,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             yaw.to_radians(),
             pitch.to_radians(),
         );
+    }
+
+    if let Some(steps) = &args.script {
+        // With clients to start, hold the script until one has a window up.
+        state.script = Some(Script::parse(steps, !args.commands.is_empty())?);
     }
 
     info!(socket = ?state.socket_name, "listening for Wayland clients");

@@ -17,21 +17,30 @@ nix develop -c cargo fmt
 ```
 
 New files must be `git add`ed before Nix can see them. The dev shell provides
-`foot`, `weston-terminal`, `es2gears_wayland` (a GPU/dmabuf client) and
+`foot`, `weston-terminal`, `es2gears_wayland` (a GPU/dmabuf client),
+`gtk4-widget-factory` and `gtk4-demo` (menus, popovers, sliders) and
 `wayland-info` as test clients.
 
 ## Verifying changes
 
-Check rendering by taking a screenshot and looking at it:
+Check behaviour by scripting input, taking a screenshot and looking at it:
 
 ```sh
 nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
-    -c "foot -e sh -c 'echo hello; sleep 5'" --screenshot <scratch>/shot.png
+    -c foot --script "wait 20; use; key 35; key 23; wait 20" \
+    --screenshot <scratch>/shot.png
 ```
 
 - `--smoke` exits 0 after 60 frames; with `-c <client>` the frames only count
   once that client's window has been drawn, and it exits 1 after 10 s otherwise.
+- `--script` plays input through the same handlers real devices use: mode
+  switches, pointer moves, clicks, drags, scrolling, key taps, and camera
+  moves. The steps are documented at the top of `src/script.rs`. Smoke frames
+  only count once the script has finished.
 - `--screenshot` saves the final frame as a PNG; open it with the Read tool.
+  To click a widget, take a screenshot first and read its position off it:
+  `move X Y` takes output pixels, which are screenshot pixels under
+  `headless-run`.
 - `--camera X,Z,YAW,PITCH` (metres and degrees) starts the view somewhere else,
   for screenshots of a particular angle.
 - `scripts/headless-run` uses a headless Weston as the host session. Always use
@@ -41,13 +50,16 @@ nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
 - `RUST_LOG=info,smithay=warn,fpsdesk::render=trace` logs each window texture
   update, which shows whether a client's frames are arriving.
 
-There is no way to inject input from here. Ask the user to check typing,
-clicking and movement by hand, and say plainly that they are unverified. Keep
-the rules behind input (camera, picking, movement keys, modes) in the pure
-`world/` and `input/controls.rs` code, where unit tests can reach them.
+Verify input changes this way before handing them to the user. Keep the rules
+behind input (camera, picking, movement keys, modes) in the pure `world/` and
+`input/controls.rs` code, where unit tests can reach them too.
 
-Headless Weston has no pointer and no relative-pointer protocol, so the nested
-backend's mouse-capture path only runs on the user's real desktop.
+What a script cannot reach is the nested backend's handling of the host's
+pointer (locking, hiding, relative motion): headless Weston has no pointer.
+Changes there need the user to try them on their desktop; say so plainly.
+
+Smithay logs `surface missing from known popups` at error level when a GTK
+menu is dismissed. It comes from Smithay's own commit hook and is harmless.
 
 ## Commits
 

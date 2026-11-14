@@ -1,5 +1,9 @@
 use smithay::{
-    desktop::{PopupKind, Window, find_popup_root_surface, get_popup_toplevel_coords},
+    desktop::{
+        PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy, Window,
+        find_popup_root_surface, get_popup_toplevel_coords,
+    },
+    input::{Seat, pointer::Focus},
     reexports::wayland_server::protocol::{wl_seat::WlSeat, wl_surface::WlSurface},
     utils::{Rectangle, Serial},
     wayland::shell::xdg::{
@@ -9,6 +13,10 @@ use smithay::{
 use tracing::info;
 
 use crate::state::State;
+
+/// How far past its window's edges a popup may reach, in logical pixels,
+/// before it is asked to flip or slide back.
+const POPUP_MARGIN: i32 = 1000;
 
 impl XdgShellHandler for State {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -41,10 +49,50 @@ impl XdgShellHandler for State {
         surface.send_repositioned(token);
     }
 
-    // Popup grabs (click outside a menu to dismiss it) come with interact mode
-    // in M4. Interactive move and resize requests are left at their no-op
-    // defaults: 2D window dragging is replaced by 3D placement in M5.
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {}
+    /// A menu asks to grab input: while it is open, keys go to it, and a
+    /// click anywhere outside its application dismisses it.
+    ///
+    /// Interactive move and resize requests are left at their no-op defaults:
+    /// 2D window dragging is replaced by 3D placement in M5.
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        let Some(seat) = Seat::<State>::from_resource(&seat) else {
+            return;
+        };
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        if self.window_for_toplevel(&root).is_none() {
+            return;
+        }
+        let Ok(mut grab) = self.popups.grab_popup(root, kind, &seat, serial) else {
+            return;
+        };
+
+        // A grab is only granted in response to the input that asked for it;
+        // if something else has grabbed the device since, refuse.
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+    }
 }
 
 /// Send the initial configure that xdg-shell requires in response to a
@@ -70,11 +118,12 @@ pub fn handle_commit(state: &mut State, surface: &WlSurface) {
 }
 
 impl State {
-    /// Adjust a popup's position so that it stays within its window.
+    /// Settle where a popup goes.
     ///
-    /// There is no screen edge to keep a popup away from in 3D, but for now a
-    /// window's texture only covers the window itself, so anything outside it
-    /// would not be drawn. M4 gives popups panels of their own.
+    /// On a flat desktop a popup is kept from running off the screen. Here
+    /// there is no screen edge: a popup is drawn in its window's plane and may
+    /// hang past the window's edges. So the only limit is a generous margin
+    /// around the window, to stop a huge menu reaching the ground.
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let kind = PopupKind::Xdg(popup.clone());
         let Ok(root) = find_popup_root_surface(&kind) else {
@@ -84,9 +133,13 @@ impl State {
             return;
         };
 
-        // The positioner works relative to the popup's parent, so express the
-        // window's rectangle in those coordinates.
-        let mut target = Rectangle::from_size(window.geometry().size);
+        // The allowed area relative to the window's top-left corner...
+        let size = window.geometry().size;
+        let mut target = Rectangle::new(
+            (-POPUP_MARGIN, -POPUP_MARGIN).into(),
+            (size.w + 2 * POPUP_MARGIN, size.h + 2 * POPUP_MARGIN).into(),
+        );
+        // ...and then relative to the popup's parent, as the positioner wants.
         target.loc -= get_popup_toplevel_coords(&kind);
 
         popup.with_pending_state(|state| {

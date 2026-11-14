@@ -6,7 +6,7 @@ use glam::{Vec2, Vec3};
 use smithay::{
     backend::{renderer::gles::GlesRenderer, winit::WinitGraphicsBackend},
     desktop::{PopupManager, Window, space::SpaceElement},
-    input::{Seat, SeatState},
+    input::{Seat, SeatState, pointer::CursorImageStatus},
     output::Output,
     reexports::{
         calloop::{self, EventLoop, Interest, LoopSignal, PostAction, generic::Generic},
@@ -16,7 +16,7 @@ use smithay::{
             protocol::wl_surface::WlSurface,
         },
     },
-    utils::{IsAlive, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Point, SERIAL_COUNTER},
     wayland::{
         compositor::{CompositorClientState, CompositorState},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -31,7 +31,11 @@ use smithay::{
 use crate::{
     handlers,
     input::controls::{Mode, MoveKeys},
-    render::{scene::SceneRenderer, window::WindowTexture},
+    render::{
+        scene::SceneRenderer,
+        window::{Extent, WindowTexture},
+    },
+    script::Script,
     world::{self, Camera, EYE_HEIGHT, Panel},
 };
 
@@ -41,10 +45,35 @@ pub struct WindowEntry {
     /// Which `world::arc_slot` the window occupies.
     pub slot: usize,
     pub panel: Panel,
+    /// The area the window covered when last drawn; `None` until then.
+    pub extent: Option<Extent>,
     /// The window's flattened picture; `None` until it first has content.
     pub texture: Option<WindowTexture>,
     /// Whether to draw attention to the window this frame.
     pub highlight: Highlight,
+}
+
+impl WindowEntry {
+    /// The panel the window's picture is on: its own panel, grown to take in
+    /// any open popups. `None` until the window has been drawn.
+    pub fn content_panel(&self) -> Option<Panel> {
+        let Extent { geometry, content } = self.extent?;
+        let size = Vec2::new(geometry.size.w as f32, geometry.size.h as f32);
+        let offset = content.loc - geometry.loc;
+        let min = Vec2::new(offset.x as f32, offset.y as f32) / size;
+        let max = min + Vec2::new(content.size.w as f32, content.size.h as f32) / size;
+        Some(self.panel.region(min, max))
+    }
+
+    /// The point in window coordinates that `uv`, a position on the content
+    /// panel as in `world::Hit`, corresponds to.
+    pub fn window_point(&self, uv: Vec2) -> Option<Point<f64, Logical>> {
+        let content = self.extent?.content.to_f64();
+        Some(Point::from((
+            content.loc.x + f64::from(uv.x) * content.size.w,
+            content.loc.y + f64::from(uv.y) * content.size.h,
+        )))
+    }
 }
 
 /// Why a window is outlined.
@@ -90,6 +119,19 @@ pub struct State {
     /// Keys whose press we kept for ourselves, by xkb key code.
     pub suppressed_keys: HashSet<u32>,
 
+    /// Where the pointer is on the output in interact mode, in logical pixels.
+    pub cursor: Vec2,
+    /// How the client under the pointer wants the cursor to look.
+    pub cursor_status: CursorImageStatus,
+    /// Pointer buttons held down, by evdev code.
+    pub pressed_buttons: HashSet<u32>,
+    /// Buttons whose press we kept for ourselves.
+    pub suppressed_buttons: HashSet<u32>,
+    /// The window a held button went down on. Until the button is released
+    /// the pointer stays in that window's coordinates, even past its edges,
+    /// so that a drag carries on smoothly.
+    pub drag_window: Option<Window>,
+
     pub camera: Camera,
     /// The window under the crosshair.
     pub hovered: Option<Window>,
@@ -110,6 +152,8 @@ pub struct State {
     pub seat: Seat<State>,
 
     pub smoke: Option<Smoke>,
+    /// Scripted input for automated checks. See `script.rs`.
+    pub script: Option<Script>,
 }
 
 impl State {
@@ -156,6 +200,11 @@ impl State {
             has_relative_pointer: false,
             last_pointer_position: None,
             suppressed_keys: HashSet::new(),
+            cursor: Vec2::ZERO,
+            cursor_status: CursorImageStatus::default_named(),
+            pressed_buttons: HashSet::new(),
+            suppressed_buttons: HashSet::new(),
+            drag_window: None,
             camera,
             hovered: None,
             focused: None,
@@ -171,6 +220,7 @@ impl State {
             data_device_state,
             seat,
             smoke: None,
+            script: None,
         })
     }
 
@@ -221,6 +271,7 @@ impl State {
             window: window.clone(),
             slot,
             panel: world::arc_slot(slot),
+            extent: None,
             texture: None,
             highlight: Highlight::None,
         });
@@ -292,6 +343,15 @@ impl State {
         let Some(smoke) = self.smoke.as_mut() else {
             return false;
         };
+        // Frames only count once any scripted input has finished playing, so
+        // that a screenshot shows its result.
+        if self
+            .script
+            .as_ref()
+            .is_some_and(|script| !script.is_finished())
+        {
+            return false;
+        }
         // A window gets its texture the first time it is drawn into the world.
         let window_shown = self.windows.iter().any(|entry| entry.texture.is_some());
         if smoke.passed || (smoke.needs_window && !window_shown) {

@@ -3,9 +3,10 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0 to M3 done.** You can walk around windows standing in an open
-space, focus one and type into it. The pointer is not routed to clients yet.
-Next up is M4.
+Status: **M0 to M3 done. M4 implemented**: clicking, dragging, scrolling,
+typing, menus and client cursors are checked by scripted input and
+screenshots. What is left to confirm by hand is the nested window's handling
+of the host's own pointer when switching modes. Next up is M5.
 
 ## Decisions
 
@@ -70,6 +71,7 @@ src/
   handlers/     Wayland protocol handler impls (xdg-shell, compositor, shm, ...)
   backend/      winit.rs (nested) now; udev.rs (DRM + libinput) in M6
   input/        mode state machine, key bindings, pointer routing
+  script.rs     scripted input for automated checks (--script)
   world/        camera, panels, ray picking, placement. No GL, no Smithay types.
   render/       all raw GL: world framebuffer, shaders, window textures
 ```
@@ -193,8 +195,10 @@ whatever using it day to day shows up.
 4. **Smithay churn.** We track git master, which has no stability promise.
    The revision is pinned in `Cargo.toml`; upgrade on purpose, not incidentally.
 5. **Popups in 3D.** xdg-popup positioning assumes a screen rectangle to stay
-   within. Plan: popups are extra quads in the parent's plane, constrained to a
-   generous virtual rectangle around the parent.
+   within. Handled in M4: a window's texture and quad grow to take in its open
+   popups, which lie in the window's plane and may hang past its edges, and
+   popups are only constrained to a generous margin around the window. Picking
+   treats the gaps between a window and its popups as holes.
 6. **Performance on integrated graphics.** Regenerating mipmaps for large,
    busy windows each frame looked like it might be costly. Measured in M3 on
    this laptop (Intel Arc B390) with a constantly scrolling 2560x1600 terminal

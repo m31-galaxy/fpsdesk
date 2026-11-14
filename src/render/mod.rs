@@ -21,13 +21,19 @@ use smithay::{
         Color32F, Renderer,
         damage::OutputDamageTracker,
         element::{
-            Id, Kind, render_elements, solid::SolidColorRenderElement,
+            Id, Kind, render_elements,
+            solid::SolidColorRenderElement,
+            surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             texture::TextureRenderElement,
+            utils::RescaleRenderElement,
         },
         gles::{GlesRenderer, GlesTarget, GlesTexture},
         utils::CommitCounter,
     },
+    input::pointer::CursorImageSurfaceData,
+    reexports::wayland_server::protocol::wl_surface::WlSurface,
     utils::{Physical, Point, Rectangle, Size, Transform},
+    wayland::compositor::with_states,
 };
 
 use crate::{
@@ -52,6 +58,25 @@ render_elements! {
     OutputElement<=GlesRenderer>;
     World=TextureRenderElement<GlesTexture>,
     Overlay=SolidColorRenderElement,
+    Cursor=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
+}
+
+/// What pass 3 draws over the world.
+#[derive(Default)]
+pub struct Overlays<'a> {
+    /// A crosshair in the middle of the view.
+    pub crosshair: bool,
+    /// A client's cursor image.
+    pub cursor: Option<CursorSprite<'a>>,
+}
+
+/// A cursor image supplied by a client, and where to draw it.
+pub struct CursorSprite<'a> {
+    pub surface: &'a WlSurface,
+    /// Where the pointer is on the output. The image's hotspot goes here.
+    pub position: Point<i32, Physical>,
+    /// Output pixels per logical pixel.
+    pub scale: f64,
 }
 
 /// Passes 1 and 2: update the window textures, then draw the world as seen by
@@ -67,16 +92,20 @@ pub fn render_world(
 ) -> Result<GlesTexture, Box<dyn Error>> {
     let mut quads = Vec::with_capacity(windows.len());
     for entry in windows {
-        let Some(image) =
-            WindowTexture::update(&mut entry.texture, renderer, &entry.window, scale)?
-        else {
+        let image = WindowTexture::update(&mut entry.texture, renderer, &entry.window, scale)?;
+        entry.extent = image.as_ref().map(|image| image.extent);
+        let Some(image) = image else {
             continue;
         };
         if image.changed {
             tracing::trace!(slot = entry.slot, "window texture updated");
         }
 
-        entry.panel.size = Vec2::new(image.size.w as f32, image.size.h as f32) / PIXELS_PER_METRE;
+        // The panel is the window proper; its picture may be bigger, to take
+        // in open popups.
+        let geometry = image.extent.geometry.size;
+        entry.panel.size = Vec2::new(geometry.w as f32, geometry.h as f32) / PIXELS_PER_METRE;
+        let content = entry.content_panel().unwrap_or(entry.panel);
 
         let outline = match entry.highlight {
             Highlight::None => None,
@@ -95,7 +124,7 @@ pub fn render_world(
         quads.push((
             distance,
             Quad {
-                model: entry.panel.model(),
+                model: content.model(),
                 texture: image.texture,
                 outline,
             },
@@ -126,8 +155,7 @@ impl Presenter {
     }
 
     /// Draw `world` over the whole of `framebuffer`, which is `size` pixels
-    /// and displayed with `transform`, with a crosshair in the middle if
-    /// `crosshair` is set.
+    /// and displayed with `transform`, and `overlays` over that.
     pub fn present(
         &mut self,
         renderer: &mut GlesRenderer,
@@ -135,17 +163,47 @@ impl Presenter {
         size: Size<i32, Physical>,
         transform: Transform,
         world: GlesTexture,
-        crosshair: bool,
+        overlays: Overlays<'_>,
     ) -> Result<(), Box<dyn Error>> {
         if self.damage_tracker.as_ref().is_none_or(|(s, _)| *s != size) {
-            // Scale 1: the world image is already in output pixels.
+            // Scale 1: everything here is positioned in output pixels.
             self.damage_tracker = Some((size, OutputDamageTracker::new(size, 1.0, transform)));
         }
         let (_, damage_tracker) = self.damage_tracker.as_mut().expect("just created");
 
         // Front to back: the first element is drawn on top.
-        let mut elements: Vec<OutputElement> = Vec::with_capacity(3);
-        if crosshair {
+        let mut elements: Vec<OutputElement> = Vec::new();
+
+        if let Some(cursor) = overlays.cursor {
+            let hotspot = with_states(cursor.surface, |states| {
+                states
+                    .data_map
+                    .get::<CursorImageSurfaceData>()
+                    .map(|data| data.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            let corner = cursor.position - hotspot.to_physical_precise_round(cursor.scale);
+            let surfaces: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                render_elements_from_surface_tree(
+                    renderer,
+                    cursor.surface,
+                    corner,
+                    1.0,
+                    1.0,
+                    Kind::Cursor,
+                );
+            // The surface elements are sized in logical pixels; scale them up
+            // to output pixels about the image's corner.
+            elements.extend(surfaces.into_iter().map(|surface| {
+                OutputElement::Cursor(RescaleRenderElement::from_element(
+                    surface,
+                    corner,
+                    cursor.scale,
+                ))
+            }));
+        }
+
+        if overlays.crosshair {
             let centre = Point::<i32, Physical>::from((size.w / 2, size.h / 2));
             // A horizontal and a vertical bar, each two arms long.
             let bars: [Size<i32, Physical>; 2] = [
@@ -166,6 +224,7 @@ impl Presenter {
                 )));
             }
         }
+
         elements.push(OutputElement::World(
             TextureRenderElement::from_static_texture(
                 self.world_id.clone(),

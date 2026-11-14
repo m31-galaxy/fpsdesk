@@ -54,9 +54,15 @@
               weston
               wayland-utils
               mesa-demos
+              # GTK demo programs (gtk4-demo, gtk4-widget-factory): menus and
+              # popovers to exercise popups and pointer input.
+              gtk4.dev
             ];
 
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+            # The GTK demos load SVG icons through gdk-pixbuf and exit if it
+            # has no SVG loader; this is where it finds one.
+            GDK_PIXBUF_MODULE_FILE = "${pkgs.librsvg}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache";
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
         }

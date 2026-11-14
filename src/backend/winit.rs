@@ -12,8 +12,12 @@ use std::{
 use glam::Vec2;
 use smithay::{
     backend::winit::{WinitEvent, WinitEventLoop},
+    desktop::utils::send_frames_surface_tree,
     output::{Mode, Output, PhysicalProperties, Scale, Subpixel},
-    reexports::{calloop::EventLoop, winit::window::CursorGrabMode},
+    reexports::{
+        calloop::EventLoop,
+        winit::{dpi::PhysicalPosition, window::CursorGrabMode},
+    },
     utils::{Rectangle, Transform},
 };
 use tracing::{error, info, warn};
@@ -22,7 +26,7 @@ use super::relative_pointer::RelativePointer;
 use crate::{
     frame_stats::FrameStats,
     input::controls::Mode as ControlMode,
-    render::{self, Presenter, screenshot},
+    render::{self, CursorSprite, Overlays, Presenter, screenshot},
     state::State,
 };
 
@@ -46,6 +50,8 @@ struct Nested {
     /// Relative motion from the host, if it offers it. Never dropped: see
     /// `RelativePointer::new`.
     relative_pointer: Option<ManuallyDrop<RelativePointer>>,
+    /// Whether the host's own cursor is showing over our window.
+    host_cursor_visible: bool,
     /// Whether we currently hold the host's pointer.
     pointer_captured: bool,
 }
@@ -109,6 +115,7 @@ pub fn init(
         last_frame: Instant::now(),
         relative_pointer,
         pointer_captured: false,
+        host_cursor_visible: true,
     };
 
     event_loop
@@ -155,14 +162,15 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
     let size = state.backend.window_size();
     let scale = nested.output.current_scale().fractional_scale();
 
-    sync_pointer_capture(state, nested);
+    state.run_script_step();
+    sync_host_pointer(state, nested);
     if let Some(relative_pointer) = nested.relative_pointer.as_mut() {
         // Taken every frame, used or not, so that motion made in interact
         // mode does not pile up and swing the view on return to walking.
         let (dx, dy) = relative_pointer.take_motion();
         state.look(Vec2::new(dx as f32, dy as f32));
     }
-    state.advance(dt.as_secs_f32(), size.w as f32 / size.h as f32);
+    state.advance(dt.as_secs_f32());
 
     let world = render::render_world(
         state.backend.renderer(),
@@ -175,7 +183,17 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
 
     let smoke_finished = state.smoke_frame_rendered();
     {
-        let crosshair = state.mode == ControlMode::Walk;
+        // Cloned so that it does not hold a borrow of `state` across `bind`.
+        let cursor_surface = state.cursor_surface().cloned();
+        let overlays = Overlays {
+            crosshair: state.mode == ControlMode::Walk,
+            cursor: cursor_surface.as_ref().map(|surface| CursorSprite {
+                surface,
+                position: <(i32, i32)>::from((state.cursor.as_dvec2() * scale).round().as_ivec2())
+                    .into(),
+                scale,
+            }),
+        };
         let (renderer, mut framebuffer) = state.backend.bind()?;
         nested.presenter.present(
             renderer,
@@ -183,7 +201,7 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
             size,
             OUTPUT_TRANSFORM,
             world,
-            crosshair,
+            overlays,
         )?;
 
         let screenshot = state.smoke.as_ref().and_then(|s| s.screenshot.as_deref());
@@ -204,6 +222,12 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
             });
     }
 
+    if let Some(surface) = state.cursor_surface() {
+        send_frames_surface_tree(surface, &nested.output, elapsed, None, |_, _| {
+            Some(nested.output.clone())
+        });
+    }
+
     state.refresh();
     state.display_handle.flush_clients()?;
     nested.stats.frame(frame_start.elapsed());
@@ -213,23 +237,36 @@ fn redraw(state: &mut State, nested: &mut Nested) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// Lock and hide the host's pointer while walking, and give it back otherwise.
-fn sync_pointer_capture(state: &mut State, nested: &mut Nested) {
-    let wanted = state.wants_pointer_capture();
-    if wanted == nested.pointer_captured {
-        return;
-    }
-    nested.pointer_captured = wanted;
-
+/// Make the host's pointer match our mode: locked and hidden while walking,
+/// free in interact mode, and visible only when no client draws its own.
+fn sync_host_pointer(state: &mut State, nested: &mut Nested) {
+    let capture = state.wants_pointer_capture();
+    let visible = state.wants_default_cursor();
+    let size = state.backend.window_size();
     let window = state.backend.window();
-    let grab = if wanted {
-        CursorGrabMode::Locked
-    } else {
-        CursorGrabMode::None
-    };
-    if let Err(err) = window.set_cursor_grab(grab) {
-        // Not retried: `pointer_captured` already records the attempt.
-        warn!(%err, "the host would not let us lock the pointer");
+
+    if capture != nested.pointer_captured {
+        nested.pointer_captured = capture;
+        if !capture {
+            // Ask for the pointer to reappear in the middle of the window,
+            // where the crosshair was, rather than wherever it was locked.
+            // Only a hint, and only honoured while still locked.
+            let centre = PhysicalPosition::new(size.w / 2, size.h / 2);
+            let _ = window.set_cursor_position(centre.into());
+        }
+        let grab = if capture {
+            CursorGrabMode::Locked
+        } else {
+            CursorGrabMode::None
+        };
+        if let Err(err) = window.set_cursor_grab(grab) {
+            // Not retried: `pointer_captured` already records the attempt.
+            warn!(%err, "the host would not let us lock the pointer");
+        }
     }
-    window.set_cursor_visible(!wanted);
+
+    if visible != nested.host_cursor_visible {
+        nested.host_cursor_visible = visible;
+        window.set_cursor_visible(visible);
+    }
 }

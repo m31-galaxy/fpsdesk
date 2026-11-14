@@ -39,9 +39,9 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    // Nested, the host draws its own cursor over our window. We start drawing
-    // client cursors ourselves in M4.
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_status = image;
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         // The clipboard follows keyboard focus.

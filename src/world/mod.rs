@@ -143,10 +143,29 @@ impl Panel {
         Mat4::from_scale_rotation_translation(self.size.extend(1.0), self.rotation, self.center)
     }
 
-    /// Where `ray` meets the front of the panel, if it does. A ray arriving
-    /// from behind misses: the back shows the window mirrored, and pointing
-    /// at that should not count as pointing at the window.
-    pub fn intersect(&self, ray: &Ray) -> Option<Hit> {
+    /// The panel covering part of this panel's plane: the rectangle from
+    /// `min` to `max`, given like `Hit::uv` as fractions of this panel's size
+    /// from its top-left corner. The fractions may lie outside 0 to 1, which
+    /// is how a window's popups, hanging off its edges, get their place.
+    pub fn region(&self, min: Vec2, max: Vec2) -> Panel {
+        let middle = (min + max) / 2.0;
+        let offset = Vec3::new(
+            (middle.x - 0.5) * self.size.x,
+            (0.5 - middle.y) * self.size.y,
+            0.0,
+        );
+        Panel {
+            center: self.center + self.rotation * offset,
+            rotation: self.rotation,
+            size: (max - min) * self.size,
+        }
+    }
+
+    /// Where `ray` meets the plane the panel lies in, approaching from the
+    /// front. The hit's `uv` is outside 0 to 1 if that is beyond the panel's
+    /// edges. A ray arriving from behind misses: the back shows the window
+    /// mirrored, and pointing at that should not count as pointing at it.
+    pub fn intersect_plane(&self, ray: &Ray) -> Option<Hit> {
         // Work in the panel's own frame, where it lies in the z = 0 plane,
         // centred on the origin, with its front towards +z.
         let to_local = self.rotation.inverse();
@@ -159,24 +178,34 @@ impl Panel {
         }
         let distance = -origin.z / direction.z;
         let point = origin + direction * distance;
-
-        let half = self.size / 2.0;
-        if point.x.abs() > half.x || point.y.abs() > half.y {
-            return None;
-        }
         Some(Hit {
             distance,
             uv: Vec2::new(point.x / self.size.x + 0.5, 0.5 - point.y / self.size.y),
         })
     }
+
+    /// Where `ray` meets the front of the panel itself, if it does.
+    pub fn intersect(&self, ray: &Ray) -> Option<Hit> {
+        self.intersect_plane(ray)
+            .filter(|hit| hit.uv.cmpge(Vec2::ZERO).all() && hit.uv.cmple(Vec2::ONE).all())
+    }
 }
 
 /// The panel `ray` reaches first, as its index in `panels`, and where.
-pub fn pick<'a>(ray: &Ray, panels: impl IntoIterator<Item = &'a Panel>) -> Option<(usize, Hit)> {
+///
+/// `solid` says whether a hit counts: a panel can have holes (the gaps
+/// between a window and the menus hanging off it), and a ray through a hole
+/// carries on to whatever is behind.
+pub fn pick<'a>(
+    ray: &Ray,
+    panels: impl IntoIterator<Item = &'a Panel>,
+    mut solid: impl FnMut(usize, &Hit) -> bool,
+) -> Option<(usize, Hit)> {
     panels
         .into_iter()
         .enumerate()
         .filter_map(|(index, panel)| Some((index, panel.intersect(ray)?)))
+        .filter(|(index, hit)| solid(*index, hit))
         .min_by(|(_, a), (_, b)| a.distance.total_cmp(&b.distance))
 }
 
@@ -403,6 +432,51 @@ mod tests {
     }
 
     #[test]
+    fn plane_hits_continue_past_the_panel_edges() {
+        let panel = panel_ahead();
+        // One metre beyond the right edge, level with the middle.
+        let toward = Vec3::new(2.0, 0.0, -3.0);
+        assert!(panel.intersect(&ray(Vec3::ZERO, toward)).is_none());
+        let hit = panel
+            .intersect_plane(&ray(Vec3::ZERO, toward))
+            .expect("the plane is hit");
+        assert!(close2(hit.uv, Vec2::new(1.5, 0.5)));
+    }
+
+    #[test]
+    fn region_covers_the_requested_part_of_the_plane() {
+        let panel = panel_ahead();
+
+        let whole = panel.region(Vec2::ZERO, Vec2::ONE);
+        assert!(close(whole.center, panel.center));
+        assert!(close2(whole.size, panel.size));
+
+        // A menu hanging below the bottom-left corner: the left quarter of
+        // the width, from the bottom edge down by half the height again.
+        let menu = panel.region(Vec2::new(0.0, 1.0), Vec2::new(0.25, 1.5));
+        assert!(close2(menu.size, Vec2::new(0.5, 0.5)));
+        assert!(close(menu.center, Vec3::new(-0.75, -0.75, -3.0)));
+
+        // A point seen through the region maps back to the same place on the
+        // original panel's plane.
+        let through = ray(Vec3::ZERO, Vec3::new(-0.75, -0.75, -3.0));
+        let on_menu = menu.intersect(&through).expect("hit");
+        assert!(close2(on_menu.uv, Vec2::new(0.5, 0.5)));
+        let on_panel = panel.intersect_plane(&through).expect("hit");
+        assert!(close2(on_panel.uv, Vec2::new(0.125, 1.25)));
+    }
+
+    #[test]
+    fn region_follows_a_turned_panel() {
+        let panel = Panel::facing(Vec3::new(3.0, 0.0, 0.0), Vec3::ZERO, Vec2::new(2.0, 1.0));
+        // The right half, as seen from the front. Seen from the origin this
+        // panel's right is towards +Z.
+        let right_half = panel.region(Vec2::new(0.5, 0.0), Vec2::ONE);
+        assert!(close(right_half.center, Vec3::new(3.0, 0.0, 0.5)));
+        assert!(close2(right_half.size, Vec2::new(1.0, 1.0)));
+    }
+
+    #[test]
     fn pick_returns_the_nearest_panel_hit() {
         let far = panel_ahead();
         let near = Panel {
@@ -415,12 +489,29 @@ mod tests {
         };
         let straight = ray(Vec3::ZERO, Vec3::NEG_Z);
 
-        let (index, hit) = pick(&straight, [&far, &aside, &near]).expect("hit");
+        let (index, hit) = pick(&straight, [&far, &aside, &near], |_, _| true).expect("hit");
         assert_eq!(index, 2);
         assert!((hit.distance - 1.0).abs() < EPS);
 
-        assert!(pick(&straight, [&aside]).is_none());
-        assert!(pick(&straight, []).is_none());
+        assert!(pick(&straight, [&aside], |_, _| true).is_none());
+        assert!(pick(&straight, [], |_, _| true).is_none());
+    }
+
+    #[test]
+    fn pick_passes_through_holes() {
+        let far = panel_ahead();
+        let near = Panel {
+            center: Vec3::new(0.0, 0.0, -1.0),
+            ..panel_ahead()
+        };
+        let straight = ray(Vec3::ZERO, Vec3::NEG_Z);
+
+        // The near panel has a hole where the ray meets it.
+        let (index, hit) = pick(&straight, [&far, &near], |index, _| index != 1).expect("hit");
+        assert_eq!(index, 0);
+        assert!((hit.distance - 3.0).abs() < EPS);
+
+        assert!(pick(&straight, [&far, &near], |_, _| false).is_none());
     }
 
     #[test]

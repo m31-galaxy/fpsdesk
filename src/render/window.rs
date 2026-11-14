@@ -4,6 +4,9 @@
 //! and transforms, viewport crops and video formats are all its problem. What
 //! comes out is one plain RGBA texture per window, which pass 2 can put on a
 //! quad and which, unlike a client's own buffer, can have mipmaps.
+//!
+//! The texture covers the window and any popups (menus, tooltips) it has
+//! open, which can hang past the window's edges.
 
 use std::error::Error;
 
@@ -17,8 +20,8 @@ use smithay::{
             gles::{GlesRenderer, GlesTexture, ffi},
         },
     },
-    desktop::Window,
-    utils::{Logical, Physical, Point, Scale, Size, Transform},
+    desktop::{PopupManager, Window},
+    utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform},
 };
 
 pub struct WindowTexture {
@@ -28,12 +31,44 @@ pub struct WindowTexture {
     damage_tracker: OutputDamageTracker,
 }
 
+/// The area a window occupies, in window coordinates: logical pixels measured
+/// from the origin of its surface tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Extent {
+    /// The window proper, without any shadow the client draws around it.
+    pub geometry: Rectangle<i32, Logical>,
+    /// The window together with its open popups. This is what the texture
+    /// shows.
+    pub content: Rectangle<i32, Logical>,
+}
+
+impl Extent {
+    /// Measure `window`. `None` while it has nothing to show.
+    pub fn of(window: &Window) -> Option<Self> {
+        let geometry = window.geometry();
+        if geometry.size.w <= 0 || geometry.size.h <= 0 {
+            return None;
+        }
+
+        let mut content = geometry;
+        if let Some(toplevel) = window.toplevel() {
+            for (popup, location) in PopupManager::popups_for_surface(toplevel.wl_surface()) {
+                // A popup's location is that of its own geometry relative to
+                // the window's.
+                let rect = Rectangle::new(geometry.loc + location, popup.geometry().size);
+                content = content.merge(rect);
+            }
+        }
+        Some(Self { geometry, content })
+    }
+}
+
 /// A window's current picture.
 pub struct WindowImage {
     /// GL name of the texture. Premultiplied alpha, first row at the top.
     pub texture: u32,
-    /// Size of the window in logical pixels.
-    pub size: Size<i32, Logical>,
+    /// What the texture covers.
+    pub extent: Extent,
     /// Whether the texture's contents changed in this update.
     pub changed: bool,
 }
@@ -48,13 +83,10 @@ impl WindowTexture {
         window: &Window,
         scale: f64,
     ) -> Result<Option<WindowImage>, Box<dyn Error>> {
-        // The geometry is the window proper, without any shadow the client
-        // draws around it.
-        let geometry = window.geometry();
-        let size: Size<i32, Physical> = geometry.size.to_physical_precise_round(scale);
-        if size.w <= 0 || size.h <= 0 {
+        let Some(extent) = Extent::of(window) else {
             return Ok(None);
-        }
+        };
+        let size: Size<i32, Physical> = extent.content.size.to_physical_precise_round(scale);
 
         if slot
             .as_ref()
@@ -64,10 +96,10 @@ impl WindowTexture {
         }
         let this = slot.as_mut().expect("slot was just filled");
 
-        // Draw the surface tree so that the geometry's corner lands on the
+        // Draw the surface tree so that the content's corner lands on the
         // texture's corner.
         let origin: Point<i32, Physical> =
-            (Point::default() - geometry.loc).to_physical_precise_round(scale);
+            (Point::default() - extent.content.loc).to_physical_precise_round(scale);
         let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
             window.render_elements(renderer, origin, Scale::from(scale), 1.0);
 
@@ -95,7 +127,7 @@ impl WindowTexture {
 
         Ok(Some(WindowImage {
             texture,
-            size: geometry.size,
+            extent,
             changed,
         }))
     }
