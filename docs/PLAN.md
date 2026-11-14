@@ -6,7 +6,9 @@ first person. Application windows are panels standing in that space.
 Status: **M0 to M3 done. M4 implemented**: clicking, dragging, scrolling,
 typing, menus and client cursors are checked by scripted input and
 screenshots. What is left to confirm by hand is the nested window's handling
-of the host's own pointer when switching modes. Next up is M5.
+of the host's own pointer when switching modes. **The TTY backend of M6 is
+written but has never been run on a real console** (see M6); a login-session
+entry and NixOS module are still to do. Next up is M5.
 
 ## Decisions
 
@@ -69,7 +71,8 @@ src/
   main.rs       argument parsing, logging, event loop
   state.rs      compositor state: Smithay protocol states, seat, windows
   handlers/     Wayland protocol handler impls (xdg-shell, compositor, shm, ...)
-  backend/      winit.rs (nested) now; udev.rs (DRM + libinput) in M6
+  backend/      winit.rs (nested); tty.rs (libseat, DRM/GBM, libinput)
+  frame.rs      the per-frame work both backends share
   input/        mode state machine, key bindings, pointer routing
   script.rs     scripted input for automated checks (--script)
   world/        camera, panels, ray picking, placement. No GL, no Smithay types.
@@ -155,6 +158,18 @@ render scale); dithering to hide banding in the dark ground and sky gradients.
 **M6 - Real session.** udev/DRM/libinput/libseat backend, VT switching, vblank-
 driven frame timing, a session entry so it can be chosen at login, a NixOS
 module. *Done when* it runs from a TTY on this laptop.
+
+The backend part is written (`backend/tty.rs`, `--backend tty`) but untested
+on hardware: single GPU, one output (the internal panel if there is one, at
+its preferred mode, others ignored), `GbmBufferedSurface` driven by vblank,
+libinput with tap-to-click, a built-in arrow cursor, Ctrl+Alt+F1..F12 and
+Ctrl+Alt+Backspace always handled first, pause and resume on VT switches, and
+any fatal error exiting cleanly. A dmabuf target is drawn with
+`Transform::Normal` (first row at the top), a window surface with
+`Flipped180`; the screenshot code follows the same rule. Still to do: the
+login-session entry, the NixOS module, monitor hot-plug, a decision on what
+several monitors mean, and output scale chosen automatically (`--scale` for
+now).
 
 **M7 - Desktop plumbing.** In rough priority order: clipboard and primary
 selection; X11 apps (try `xwayland-satellite` first, which runs X11 as an

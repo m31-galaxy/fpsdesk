@@ -8,6 +8,7 @@
 //!
 //! Nothing here depends on which backend owns the output.
 
+mod cursor;
 mod gl;
 pub mod scene;
 pub mod screenshot;
@@ -32,6 +33,7 @@ use smithay::{
                 utils::RescaleRenderElement,
             },
             gles::{GlesRenderer, GlesTarget, GlesTexture},
+            sync::SyncPoint,
             utils::CommitCounter,
         },
     },
@@ -46,6 +48,7 @@ use crate::{
     state::{Highlight, WindowEntry},
     world::{Camera, PIXELS_PER_METRE, Panel},
 };
+pub use cursor::BuiltinCursor;
 use scene::{Quad, SceneRenderer};
 use window::WindowTexture;
 
@@ -66,7 +69,7 @@ render_elements! {
     World=TextureRenderElement<GlesTexture>,
     Overlay=SolidColorRenderElement,
     Cursor=RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>,
-    Text=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Image=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
 /// What pass 3 draws over the world.
@@ -78,6 +81,8 @@ pub struct Overlays<'a> {
     pub crosshair: bool,
     /// A client's cursor image.
     pub cursor: Option<CursorSprite<'a>>,
+    /// The built-in arrow, for backends with no host cursor.
+    pub builtin_cursor: Option<BuiltinCursor>,
 }
 
 /// The launcher prompt and how big to draw it.
@@ -175,6 +180,7 @@ pub struct Presenter {
     crosshair_ids: [Id; 4],
     prompt_image: Option<PromptImage>,
     damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
+    arrow: MemoryRenderBuffer,
 }
 
 impl Presenter {
@@ -184,6 +190,7 @@ impl Presenter {
             crosshair_ids: std::array::from_fn(|_| Id::new()),
             prompt_image: None,
             damage_tracker: None,
+            arrow: cursor::arrow_buffer(),
         }
     }
 
@@ -197,7 +204,7 @@ impl Presenter {
         transform: Transform,
         world: GlesTexture,
         overlays: Overlays<'_>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<SyncPoint, Box<dyn Error>> {
         if self.damage_tracker.as_ref().is_none_or(|(s, _)| *s != size) {
             // Scale 1: everything here is positioned in output pixels.
             self.damage_tracker = Some((size, OutputDamageTracker::new(size, 1.0, transform)));
@@ -206,6 +213,11 @@ impl Presenter {
 
         // Front to back: the first element is drawn on top.
         let mut elements: Vec<OutputElement> = Vec::new();
+
+        if let Some(builtin) = overlays.builtin_cursor {
+            let element = cursor::arrow_element(renderer, &self.arrow, builtin)?;
+            elements.push(OutputElement::Image(element));
+        }
 
         if let Some(sprite) = overlays.prompt {
             let text_scale = PROMPT_FONT_SCALE * (sprite.scale.round().max(1.0) as u32);
@@ -234,7 +246,7 @@ impl Presenter {
             }
             let image = self.prompt_image.as_ref().expect("just created");
             let top = size.h - margin - Prompt::height(text_scale) as i32;
-            elements.push(OutputElement::Text(
+            elements.push(OutputElement::Image(
                 MemoryRenderBufferRenderElement::from_buffer(
                     renderer,
                     Point::<f64, Physical>::from((f64::from(margin), f64::from(top))),
@@ -323,7 +335,8 @@ impl Presenter {
         ));
 
         // Age 0: the world changes every frame, so always redraw all of it.
-        damage_tracker.render_output(renderer, framebuffer, 0, &elements, Color32F::BLACK)?;
-        Ok(())
+        let result =
+            damage_tracker.render_output(renderer, framebuffer, 0, &elements, Color32F::BLACK)?;
+        Ok(result.sync)
     }
 }

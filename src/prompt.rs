@@ -31,7 +31,7 @@ pub enum PromptEvent {
     Run(String),
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Prompt {
     open: bool,
     text: String,
