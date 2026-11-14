@@ -44,6 +44,7 @@ Interact mode, with a mouse cursor:
 | --- | --- |
 | Keyboard | Goes to the focused window (outlined in amber) |
 | Mouse | Clicks, drags and scrolls whatever window is under the cursor; clicking a window focuses it |
+| Click on nothing | Back to walk mode, like Ctrl+Escape |
 
 Super also switches modes, but a host desktop normally keeps that key for
 itself.

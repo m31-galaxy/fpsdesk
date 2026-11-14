@@ -8,7 +8,8 @@
 //! Bindings:
 //! - Walk: W/A/S/D or arrows move, Shift runs, the mouse looks. Left click or
 //!   Enter on the window under the crosshair focuses it and enters interact.
-//! - Interact: clicking a window focuses it.
+//! - Interact: clicking a window focuses it; clicking on nothing returns to
+//!   walk mode.
 //! - Either mode: Super, or Ctrl+Escape, switches to the other mode. (Under a
 //!   host desktop Super usually never reaches us, hence the second binding.)
 //!
@@ -24,7 +25,7 @@ use smithay::{
         InputTime, KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
         PointerMotionEvent,
     },
-    desktop::{Window, WindowSurfaceType},
+    desktop::{PopupManager, Window, WindowSurfaceType},
     input::{
         keyboard::{FilterResult, Keycode, Keysym},
         pointer::{AxisFrame, ButtonEvent, CursorImageStatus, MotionEvent},
@@ -221,12 +222,23 @@ impl State {
                 }
 
                 self.route_pointer(time);
-                // The first button to go down picks the window: it takes the
-                // keyboard, and holds the pointer until every button is up.
-                if self.pressed_buttons.len() == 1
-                    && let Some(target) = self.cursor_target()
-                {
+                if self.pressed_buttons.len() == 1 {
+                    let Some(target) = self.cursor_target() else {
+                        // A click on nothing lets go of the window and goes
+                        // back to walking, like the mode key. The click is
+                        // ours; neither half of it reaches a client. Leaving
+                        // interact mode also closes any open menu.
+                        self.suppressed_buttons.insert(button);
+                        self.enter_walk();
+                        return;
+                    };
+                    // The first button to go down picks the window: it takes
+                    // the keyboard, and holds the pointer until every button
+                    // is up.
                     if self.focused.as_ref() != Some(&target.window) {
+                        // A menu left open in the window being left would
+                        // otherwise hold on to the keyboard.
+                        self.dismiss_popups();
                         self.focus_window(Some(&target.window));
                     }
                     self.drag_window = Some(target.window);
@@ -328,6 +340,7 @@ impl State {
         self.mode = Mode::Walk;
         self.look_motion = Vec2::ZERO;
         self.drag_window = None;
+        self.dismiss_popups();
         self.focus_window(None);
 
         // Take the pointer away from whichever client had it.
@@ -342,6 +355,33 @@ impl State {
             },
         );
         pointer.frame(self);
+    }
+
+    /// Close every open popup (menus and the like) and end any grab on the
+    /// keyboard or pointer.
+    ///
+    /// While a menu holds a grab, Smithay ignores requests to move keyboard
+    /// focus elsewhere, so this has to come before taking focus away from a
+    /// window that may have one open.
+    fn dismiss_popups(&mut self) {
+        for entry in &self.windows {
+            let Some(toplevel) = entry.window.toplevel() else {
+                continue;
+            };
+            let surface = toplevel.wl_surface();
+            let popups: Vec<_> = PopupManager::popups_for_surface(surface).collect();
+            for (popup, _) in popups {
+                // Fails only if the window has already gone.
+                let _ = PopupManager::dismiss_popup(surface, &popup);
+            }
+        }
+
+        // The grabs would only notice their popups are gone at the next
+        // input event; drop them now.
+        let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+        keyboard.unset_grab(self);
+        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        pointer.unset_grab(self, SERIAL_COUNTER.next_serial(), InputTime::now());
     }
 
     pub fn enter_interact(&mut self, window: Option<Window>) {

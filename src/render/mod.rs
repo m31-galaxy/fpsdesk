@@ -52,6 +52,7 @@ const FOCUSED_COLOR: [f32; 3] = [1.0, 0.7, 0.2];
 const CROSSHAIR_ARM: i32 = 9;
 const CROSSHAIR_THICKNESS: i32 = 2;
 const CROSSHAIR_COLOR: Color32F = Color32F::new(0.95, 0.95, 0.95, 1.0);
+const CROSSHAIR_EDGE_COLOR: Color32F = Color32F::new(0.05, 0.05, 0.05, 1.0);
 
 render_elements! {
     /// Everything pass 3 puts on an output.
@@ -141,7 +142,7 @@ pub fn render_world(
 /// Pass 3: puts the world image, and anything drawn over it, on an output.
 pub struct Presenter {
     world_id: Id,
-    crosshair_ids: [Id; 2],
+    crosshair_ids: [Id; 4],
     damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
 }
 
@@ -149,7 +150,7 @@ impl Presenter {
     pub fn new() -> Self {
         Self {
             world_id: Id::new(),
-            crosshair_ids: [Id::new(), Id::new()],
+            crosshair_ids: std::array::from_fn(|_| Id::new()),
             damage_tracker: None,
         }
     }
@@ -205,12 +206,18 @@ impl Presenter {
 
         if overlays.crosshair {
             let centre = Point::<i32, Physical>::from((size.w / 2, size.h / 2));
-            // A horizontal and a vertical bar, each two arms long.
-            let bars: [Size<i32, Physical>; 2] = [
-                (CROSSHAIR_ARM * 2, CROSSHAIR_THICKNESS).into(),
-                (CROSSHAIR_THICKNESS, CROSSHAIR_ARM * 2).into(),
+            // A horizontal and a vertical bar, each two arms long, in a light
+            // colour; then the same again a pixel bigger all round in a dark
+            // one, as an edge that keeps the crosshair visible over a white
+            // window.
+            let (long, thick) = (CROSSHAIR_ARM * 2, CROSSHAIR_THICKNESS);
+            let bars: [(Size<i32, Physical>, Color32F); 4] = [
+                ((long, thick).into(), CROSSHAIR_COLOR),
+                ((thick, long).into(), CROSSHAIR_COLOR),
+                ((long + 2, thick + 2).into(), CROSSHAIR_EDGE_COLOR),
+                ((thick + 2, long + 2).into(), CROSSHAIR_EDGE_COLOR),
             ];
-            for (id, bar) in self.crosshair_ids.iter().zip(bars) {
+            for (id, (bar, color)) in self.crosshair_ids.iter().zip(bars) {
                 let geometry = Rectangle::new(
                     Point::from((centre.x - bar.w / 2, centre.y - bar.h / 2)),
                     bar,
@@ -219,7 +226,7 @@ impl Presenter {
                     id.clone(),
                     geometry,
                     CommitCounter::default(),
-                    CROSSHAIR_COLOR,
+                    color,
                     Kind::Unspecified,
                 )));
             }
