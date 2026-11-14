@@ -44,7 +44,8 @@ use crate::{
 /// A client window and its place in the world.
 pub struct WindowEntry {
     pub window: Window,
-    /// Which `world::arc_slot` the window occupies.
+    /// Which `world::arc_slot` around the viewer the window was given when it
+    /// opened. Only used to tell windows apart in logs.
     pub slot: usize,
     pub panel: Panel,
     /// The area the window covered when last drawn; `None` until then.
@@ -275,13 +276,19 @@ impl State {
 
     /// Start managing a new window: give it a place in the world.
     pub fn add_window(&mut self, window: Window) {
-        let slot = (0..)
-            .find(|slot| self.windows.iter().all(|entry| entry.slot != *slot))
-            .expect("there is always a free slot");
+        // In front of wherever the viewer is standing and facing, or beside
+        // that if something is already there.
+        let occupied: Vec<Vec3> = self
+            .windows
+            .iter()
+            .map(|entry| entry.panel.center)
+            .collect();
+        let (slot, panel) =
+            world::place_new_panel(self.camera.position, self.camera.yaw, &occupied);
         self.windows.push(WindowEntry {
             window: window.clone(),
             slot,
-            panel: world::arc_slot(slot),
+            panel,
             extent: None,
             texture: None,
             highlight: Highlight::None,

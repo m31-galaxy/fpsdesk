@@ -4,9 +4,8 @@ A Wayland compositor whose desktop is a 3D space you walk through in first
 person. Early days: see [docs/PLAN.md](docs/PLAN.md) for the design and roadmap.
 
 It runs either as a window inside your existing session or, started from a
-virtual console, as a session of its own (the TTY backend, new and not yet
-tried on real hardware). Application windows stand on panels in an open space
-that you can walk around. Walk up to one, click it, and use it with the
+virtual console, as a session of its own. Application windows stand on panels
+in an open space that you can walk around. Walk up to one, click it, and use it with the
 keyboard and mouse as usual.
 
 ## Building and running

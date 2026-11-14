@@ -211,10 +211,10 @@ pub fn pick<'a>(
         .min_by(|(_, a), (_, b)| a.distance.total_cmp(&b.distance))
 }
 
-/// Where the `slot`th window goes while there is no real placement logic:
-/// on an arc around the origin at eye height, facing inwards, filling outwards
-/// from straight ahead (slot 0), alternating right and left.
-pub fn arc_slot(slot: usize) -> Panel {
+/// The `slot`th place for a new window around a viewer standing at `viewer`
+/// and turned by `yaw`: on an arc at eye height, facing the viewer, starting
+/// straight ahead (slot 0) and filling outwards, alternating right and left.
+pub fn arc_slot(viewer: Vec3, yaw: f32, slot: usize) -> Panel {
     const RADIUS: f32 = 1.6;
     const STEP: f32 = 40.0;
 
@@ -222,8 +222,29 @@ pub fn arc_slot(slot: usize) -> Panel {
     let side = if slot % 2 == 1 { 1.0 } else { -1.0 };
     let angle = (side * steps * STEP).to_radians();
 
-    let center = Vec3::new(RADIUS * angle.sin(), EYE_HEIGHT, -RADIUS * angle.cos());
-    Panel::facing(center, Vec3::new(0.0, EYE_HEIGHT, 0.0), Vec2::ONE)
+    let eye = Vec3::new(viewer.x, EYE_HEIGHT, viewer.z);
+    let direction = Quat::from_rotation_y(yaw) * Vec3::new(angle.sin(), 0.0, -angle.cos());
+    Panel::facing(eye + RADIUS * direction, eye, Vec2::ONE)
+}
+
+/// Where a new window goes: in front of the viewer, or failing that the
+/// nearest place to either side that is not already taken by one of the
+/// panels centred at `occupied`. Returns the slot used and the panel.
+pub fn place_new_panel(viewer: Vec3, yaw: f32, occupied: &[Vec3]) -> (usize, Panel) {
+    /// Slots 0 to 8 go all the way round to directly behind.
+    const SLOTS: usize = 9;
+    /// Centres closer than this count as the same place.
+    const SPACING: f32 = 0.6;
+
+    (0..SLOTS)
+        .map(|slot| (slot, arc_slot(viewer, yaw, slot)))
+        .find(|(_, panel)| {
+            occupied
+                .iter()
+                .all(|center| center.distance(panel.center) > SPACING)
+        })
+        // Surrounded: straight ahead will have to do.
+        .unwrap_or_else(|| (0, arc_slot(viewer, yaw, 0)))
 }
 
 #[cfg(test)]
@@ -519,7 +540,7 @@ mod tests {
     #[test]
     fn arc_slots_face_the_origin_and_do_not_coincide() {
         let eye = Vec3::new(0.0, EYE_HEIGHT, 0.0);
-        let slots: Vec<Panel> = (0..5).map(arc_slot).collect();
+        let slots: Vec<Panel> = (0..5).map(|slot| arc_slot(Vec3::ZERO, 0.0, slot)).collect();
 
         assert!(close(slots[0].center, Vec3::new(0.0, EYE_HEIGHT, -1.6)));
         // Slot 1 is to the right of straight ahead, slot 2 to the left.
@@ -531,5 +552,45 @@ mod tests {
                 assert!((panel.center - other.center).length() > 0.5);
             }
         }
+    }
+
+    #[test]
+    fn new_panels_appear_in_front_of_the_viewer_wherever_they_stand() {
+        // Standing away from the origin and facing left (-X).
+        let viewer = Vec3::new(5.0, 0.0, -3.0);
+        let (slot, panel) = place_new_panel(viewer, FRAC_PI_2, &[]);
+        assert_eq!(slot, 0);
+        assert!(close(panel.center, Vec3::new(5.0 - 1.6, EYE_HEIGHT, -3.0)));
+        // And it faces back at the viewer.
+        assert!(close(front(&panel), Vec3::X));
+    }
+
+    #[test]
+    fn new_panels_avoid_places_already_taken() {
+        let viewer = Vec3::new(5.0, 0.0, -3.0);
+        let (_, first) = place_new_panel(viewer, FRAC_PI_2, &[]);
+        let (slot, second) = place_new_panel(viewer, FRAC_PI_2, &[first.center]);
+        assert_eq!(slot, 1);
+        assert!(second.center.distance(first.center) > 0.6);
+
+        let (slot, third) = place_new_panel(viewer, FRAC_PI_2, &[first.center, second.center]);
+        assert_eq!(slot, 2);
+        assert!(third.center.distance(first.center) > 0.6);
+        assert!(third.center.distance(second.center) > 0.6);
+
+        // A panel somewhere else entirely does not get in the way.
+        let far_away = Vec3::new(-20.0, EYE_HEIGHT, 20.0);
+        assert_eq!(place_new_panel(viewer, FRAC_PI_2, &[far_away]).0, 0);
+    }
+
+    #[test]
+    fn a_surrounded_viewer_still_gets_a_panel() {
+        let viewer = Vec3::ZERO;
+        let everywhere: Vec<Vec3> = (0..9)
+            .map(|slot| arc_slot(viewer, 0.0, slot).center)
+            .collect();
+        let (slot, panel) = place_new_panel(viewer, 0.0, &everywhere);
+        assert_eq!(slot, 0);
+        assert!(close(panel.center, Vec3::new(0.0, EYE_HEIGHT, -1.6)));
     }
 }

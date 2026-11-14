@@ -45,6 +45,10 @@ nix develop -c scripts/headless-run ./target/debug/fpsdesk --smoke \
   script and the screenshot (default 60), to catch a short animation.
 - `--camera X,Z,YAW,PITCH` (metres and degrees) starts the view somewhere else,
   for screenshots of a particular angle.
+- A new window appears 1.6 m in front of wherever the camera is when it opens
+  (beside that if the place is taken). To see one closer, walk to it in the
+  script after it has opened, for example `walk 0 0.6`.
+- FPSDesk logs to stderr, as clients do; `2> file` captures both.
 - `scripts/headless-run` uses a headless Weston as the host session. Always use
   it for automated runs: on the user's real desktop the nested window pops up on
   their screen, and it draws no frames at all while their screen is locked, so

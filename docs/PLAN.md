@@ -3,12 +3,13 @@
 FPSDesk is a Wayland compositor whose desktop is a 3D space you move through in
 first person. Application windows are panels standing in that space.
 
-Status: **M0 to M4 done**, plus three things built out of order: a text
-launcher (backtick in walk mode), closing windows by shooting them (right
-click, three hits), and **the TTY backend of M6, which is written but has
-never been run on a real console** (see M6). A login-session entry and NixOS
-module are still to do. The rest of M5 (placing, moving and resizing windows)
-is next.
+Status: **M0 to M4 done**, plus things built out of order: a text launcher
+(backtick in walk mode), closing windows by shooting them (right click, three
+hits), new windows appearing in front of the viewer, and **the TTY backend of
+M6, which runs on this laptop's own panel**. Mirroring onto other displays and
+hot-plug were added after that run and have not been tried on hardware. A
+login-session entry and NixOS module are still to do. The rest of M5 (moving
+and resizing windows) is next.
 
 ## Decisions
 
@@ -162,8 +163,10 @@ render scale); dithering to hide banding in the dark ground and sky gradients.
 driven frame timing, a session entry so it can be chosen at login, a NixOS
 module. *Done when* it runs from a TTY on this laptop.
 
-The backend part is written (`backend/tty.rs`, `--backend tty`) but untested
-on hardware: single GPU, one primary output (the internal panel if there is one, at
+The backend part is written (`backend/tty.rs`, `--backend tty`). The user ran it
+on this laptop on 2026-11-14 with the internal panel alone, before mirroring
+was added; mirroring and hot-plug are untested. What it does:
+single GPU, one primary output (the internal panel if there is one, at
 its preferred mode) with every other connected display mirroring its finished
 frame, scaled to fit (the primary's dmabuf imported as a texture; a mirror is
 skipped while its last flip is pending, and dropped if it errors), hot-plug

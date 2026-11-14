@@ -267,5 +267,10 @@ fn init_logging() {
     // unless RUST_LOG says otherwise.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,smithay=warn"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // To stderr, alongside what clients print there, so that redirecting it
+    // captures the whole story; stdout is hidden behind the picture on a TTY.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
 }
