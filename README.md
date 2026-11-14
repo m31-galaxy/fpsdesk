@@ -42,8 +42,10 @@ nix develop -c ./target/debug/fpsdesk --backend tty -c foot 2> /tmp/fpsdesk.log
 
 `--backend` defaults to `nested` when `WAYLAND_DISPLAY` or `DISPLAY` is set and
 to `tty` otherwise. Logs go to stderr, so redirect them as above. `--scale 2`
-doubles the size of everything on a HiDPI panel. FPSDesk drives one monitor, the
-internal panel if there is one, and ignores any others.
+doubles the size of everything on a HiDPI panel. FPSDesk draws the world for one
+monitor, the internal panel if there is one, and mirrors that picture (scaled to
+fit, with black bars) onto any other connected monitor, including ones plugged in
+while it runs. Mirroring has not been run on real hardware yet.
 
 | | |
 | --- | --- |

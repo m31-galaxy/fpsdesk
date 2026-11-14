@@ -1,18 +1,35 @@
 //! TTY backend: FPSDesk as a real session on a virtual console.
 //!
-//! The simplest path that works: one GPU (the primary one), one output (the
-//! internal panel if there is one, else the first connected connector, at its
-//! preferred mode), libseat for the session, DRM/KMS with GBM buffers for the
-//! display, EGL on GBM for rendering, and libinput for input.
+//! The simplest path that works: one GPU (the primary one), libseat for the
+//! session, DRM/KMS with GBM buffers for the displays, EGL on GBM for
+//! rendering, and libinput for input.
 //!
-//! Frames are driven by vblank: the first frame is rendered at startup, and
-//! each page flip's completion triggers the next. When the session is paused
-//! (switched to another VT) DRM and libinput are paused with it and nothing
-//! is drawn; on resume the mode is restored and the cycle restarted.
+//! One display is the primary (the internal panel if there is one, else the
+//! first connected connector, at its preferred mode). The world is drawn for
+//! it alone, and it is the only output Wayland clients see. Every other
+//! connected display is a mirror: after the primary's frame is drawn, its
+//! scanout buffer is imported as a texture and drawn, scaled to fit with the
+//! aspect ratio kept, into the mirror's own buffer. Each mirror has its own
+//! mode, CRTC and vblank; it gets the latest frame whenever its previous
+//! flip has completed and is skipped otherwise, so it can never stall the
+//! primary. A mirror that fails is dropped with a warning.
+//!
+//! Frames are driven by the primary's vblank: the first frame is rendered at
+//! startup, and each page flip's completion triggers the next. When the
+//! session is paused (switched to another VT) DRM and libinput are paused
+//! with it and nothing is drawn; on resume the modes are restored and the
+//! cycle restarted.
+//!
+//! Hot-plug: udev change events on the DRM device rescan the connectors, which
+//! adds mirrors for newly connected displays and drops those that have gone.
+//! If the primary itself is unplugged, a warning is logged and nothing else
+//! changes: promoting a mirror would mean resizing the view and the Wayland
+//! output under running clients. (If the primary's flips then fail, that is
+//! fatal as for any primary error.)
 //!
 //! The safety bindings (VT switching and quitting) are in `input/emergency.rs`.
-//! Any error while rendering or flipping is logged and stops the event loop,
-//! so that FPSDesk exits and gives the console back instead of hanging.
+//! Any error on the primary while rendering or flipping is logged and stops
+//! the event loop, so that FPSDesk exits and gives the console back instead of hanging.
 
 use std::{
     error::Error,
@@ -24,18 +41,22 @@ use smithay::{
     backend::{
         allocator::{
             Fourcc,
+            dmabuf::Dmabuf,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{DrmDevice, DrmDeviceFd, DrmDeviceNotifier, DrmEvent, GbmBufferedSurface},
         egl::{EGLContext, EGLDisplay},
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::{Bind, gles::GlesRenderer},
+        renderer::{
+            Bind, ImportDma,
+            gles::{GlesRenderer, GlesTexture},
+        },
         session::{
             Event as SessionEvent, Session,
             libseat::{LibSeatSession, LibSeatSessionNotifier},
         },
-        udev::{all_gpus, primary_gpu},
+        udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
@@ -43,7 +64,10 @@ use smithay::{
             EventLoop,
             timer::{TimeoutAction, Timer},
         },
-        drm::control::{Device as ControlDevice, ModeTypeFlags, connector, crtc},
+        drm::control::{
+            Device as ControlDevice, Mode as DrmMode, ModeTypeFlags, ResourceHandles, connector,
+            crtc,
+        },
         input::{Device as InputDevice, Libinput},
         rustix::fs::OFlags,
     },
@@ -54,6 +78,7 @@ use tracing::{debug, error, info, warn};
 use super::Backend;
 use crate::{
     frame::{self, Frame, FrameParams},
+    render::MirrorPresenter,
     state::State,
 };
 
@@ -72,9 +97,24 @@ type Surface = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
 struct TtyOutput {
     output: Output,
     surface: Surface,
+    connector: connector::Handle,
+    crtc: crtc::Handle,
     size: Size<i32, Physical>,
     scale: f64,
     /// When a frame last went to the display, for spotting stalls.
+    last_queued: Instant,
+}
+
+/// A display that shows the primary's picture.
+struct Mirror {
+    name: String,
+    connector: connector::Handle,
+    surface: Surface,
+    crtc: crtc::Handle,
+    size: Size<i32, Physical>,
+    presenter: MirrorPresenter,
+    /// Whether a page flip is in the air. No frame is sent meanwhile.
+    pending: bool,
     last_queued: Instant,
 }
 
@@ -82,6 +122,9 @@ struct TtyOutput {
 /// GPU go before the session that lent them.
 pub struct Tty {
     output: Option<TtyOutput>,
+    mirrors: Vec<Mirror>,
+    /// Whether we have said that the primary's frame cannot be used as a texture.
+    import_warned: bool,
     renderer: GlesRenderer,
     drm: DrmDevice,
     gbm: GbmDevice<DrmDeviceFd>,
@@ -98,6 +141,7 @@ pub struct Tty {
 pub struct TtyEvents {
     session: LibSeatSessionNotifier,
     drm: DrmDeviceNotifier,
+    udev: UdevBackend,
     input: LibinputInputBackend,
 }
 
@@ -144,6 +188,8 @@ impl Tty {
 
         let tty = Self {
             output: None,
+            mirrors: Vec::new(),
+            import_warned: false,
             renderer,
             drm,
             gbm,
@@ -155,6 +201,7 @@ impl Tty {
         let events = TtyEvents {
             session: session_notifier,
             drm: drm_notifier,
+            udev: UdevBackend::new(&seat)?,
             input,
         };
         Ok((tty, events))
@@ -174,47 +221,42 @@ impl Tty {
     pub fn shutdown(&mut self) {
         // Dropping the surface turns the output off and hands the display
         // back; closing the session (when we drop) restores the console.
+        self.mirrors.clear();
         self.output = None;
     }
 
-    /// Choose the connector to drive and set up the output on it.
+    /// Choose the primary display and set up the output on it, then add a
+    /// mirror for each other connected display.
     fn create_output(
         &mut self,
         dh: &smithay::reexports::wayland_server::DisplayHandle,
         scale: f64,
     ) -> Result<Output, Box<dyn Error>> {
-        let (info, crtc) = self.pick_connector()?;
-        let drm_mode = info
-            .modes()
-            .iter()
-            .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| info.modes().first())
-            .copied()
-            .ok_or("the connector has no modes")?;
+        let resources = self.drm.resource_handles()?;
+        let mut chosen = None;
+        for info in self.connected(&resources, true) {
+            if info.modes().is_empty() {
+                warn!(output = connector_name(&info), "connected but has no modes");
+                continue;
+            }
+            match self.crtc_for(&info, &resources, &[]) {
+                Some(crtc) => {
+                    chosen = Some((info, crtc));
+                    break;
+                }
+                None => warn!(output = connector_name(&info), "no CRTC can drive it"),
+            }
+        }
+        let (info, crtc) = chosen.ok_or("no connected display found")?;
         let name = connector_name(&info);
+        let (surface, drm_mode) = self.open_surface(&info, crtc)?;
         info!(
             output = name,
             mode = ?drm_mode.size(),
             refresh = drm_mode.vrefresh(),
             ?crtc,
-            "driving output"
+            "driving primary output"
         );
-
-        let drm_surface = self.drm.create_surface(crtc, drm_mode, &[info.handle()])?;
-        let allocator = GbmAllocator::new(
-            self.gbm.clone(),
-            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-        );
-        let render_formats = self
-            .renderer
-            .egl_context()
-            .dmabuf_render_formats()
-            .iter()
-            .copied();
-        let surface =
-            GbmBufferedSurface::new(drm_surface, allocator, &COLOR_FORMATS, render_formats)
-                .map_err(|err| format!("no usable scanout buffer format: {err}"))?;
-        debug!(format = ?surface.format(), "scanout format");
 
         let mode = OutputMode::from(drm_mode);
         let (width_mm, height_mm) = info.size().unwrap_or((0, 0));
@@ -240,50 +282,179 @@ impl Tty {
         self.output = Some(TtyOutput {
             output: output.clone(),
             surface,
+            connector: info.handle(),
+            crtc,
             size: mode.size,
             scale,
             last_queued: Instant::now(),
         });
+        self.sync_mirrors(true);
         Ok(output)
     }
 
-    /// The connected connector to show the world on, and a CRTC for it. Takes
-    /// the internal panel if there is one, and logs the others as ignored.
-    fn pick_connector(&self) -> Result<(connector::Info, crtc::Handle), Box<dyn Error>> {
-        let resources = self.drm.resource_handles()?;
+    /// A scanout surface on `crtc` for `info`, at the connector's preferred
+    /// mode.
+    fn open_surface(
+        &mut self,
+        info: &connector::Info,
+        crtc: crtc::Handle,
+    ) -> Result<(Surface, DrmMode), Box<dyn Error>> {
+        let drm_mode = info
+            .modes()
+            .iter()
+            .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .or_else(|| info.modes().first())
+            .copied()
+            .ok_or("the connector has no modes")?;
+        let drm_surface = self.drm.create_surface(crtc, drm_mode, &[info.handle()])?;
+        let allocator = GbmAllocator::new(
+            self.gbm.clone(),
+            GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+        );
+        let render_formats = self
+            .renderer
+            .egl_context()
+            .dmabuf_render_formats()
+            .iter()
+            .copied();
+        let surface =
+            GbmBufferedSurface::new(drm_surface, allocator, &COLOR_FORMATS, render_formats)
+                .map_err(|err| format!("no usable scanout buffer format: {err}"))?;
+        debug!(format = ?surface.format(), "scanout format");
+        Ok((surface, drm_mode))
+    }
+
+    /// The connected connectors, the internal panel first. `probe` asks the
+    /// kernel to detect again rather than use what it last found.
+    fn connected(&self, resources: &ResourceHandles, probe: bool) -> Vec<connector::Info> {
         let mut connected: Vec<connector::Info> = resources
             .connectors()
             .iter()
-            .filter_map(|handle| self.drm.get_connector(*handle, true).ok())
+            .filter_map(|handle| self.drm.get_connector(*handle, probe).ok())
             .filter(|info| info.state() == connector::State::Connected)
             .collect();
         // Stable, so otherwise the kernel's order stands.
         connected.sort_by_key(|info| !is_internal(info));
-
-        let mut chosen = None;
-        for info in connected {
-            if chosen.is_some() {
-                info!(output = connector_name(&info), "ignoring extra monitor");
-                continue;
-            }
-            if info.modes().is_empty() {
-                warn!(output = connector_name(&info), "connected but has no modes");
-                continue;
-            }
-            match self.crtc_for(&info, &resources) {
-                Some(crtc) => chosen = Some((info, crtc)),
-                None => warn!(output = connector_name(&info), "no CRTC can drive it"),
-            }
-        }
-        chosen.ok_or_else(|| "no connected display found".into())
+        connected
     }
 
-    /// A CRTC that can drive `info`: the one it is already on if it is on one
-    /// (to avoid a needless modeset), else any that its encoders allow.
+    /// Bring the mirrors in line with the connected displays: drop those
+    /// that have gone, add one for each new display.
+    fn sync_mirrors(&mut self, probe: bool) {
+        let resources = match self.drm.resource_handles() {
+            Ok(resources) => resources,
+            Err(err) => return warn!(%err, "could not list the connectors"),
+        };
+        let connected = self.connected(&resources, probe);
+        let is_connected = |handle| connected.iter().any(|info| info.handle() == handle);
+
+        self.mirrors.retain(|mirror| {
+            let keep = is_connected(mirror.connector);
+            if !keep {
+                info!(output = mirror.name, "display unplugged; mirror removed");
+            }
+            keep
+        });
+        if let Some(primary) = &self.output
+            && !is_connected(primary.connector)
+        {
+            warn!(
+                output = primary.output.name(),
+                "the primary display is no longer connected; carrying on"
+            );
+        }
+
+        for info in &connected {
+            let handle = info.handle();
+            let primary = self.output.as_ref().map(|output| output.connector);
+            if primary == Some(handle) || self.mirrors.iter().any(|m| m.connector == handle) {
+                continue;
+            }
+            let name = connector_name(info);
+            if info.modes().is_empty() {
+                warn!(output = name, "connected but has no modes");
+                continue;
+            }
+            let taken: Vec<crtc::Handle> = self
+                .output
+                .iter()
+                .map(|output| output.crtc)
+                .chain(self.mirrors.iter().map(|mirror| mirror.crtc))
+                .collect();
+            let Some(crtc) = self.crtc_for(info, &resources, &taken) else {
+                warn!(output = name, "no free CRTC can drive it; not mirrored");
+                continue;
+            };
+            match self.open_surface(info, crtc) {
+                Ok((surface, drm_mode)) => {
+                    info!(
+                        output = name,
+                        mode = ?drm_mode.size(),
+                        refresh = drm_mode.vrefresh(),
+                        ?crtc,
+                        "mirroring the primary"
+                    );
+                    self.mirrors.push(Mirror {
+                        name,
+                        connector: handle,
+                        surface,
+                        crtc,
+                        size: OutputMode::from(drm_mode).size,
+                        presenter: MirrorPresenter::new(),
+                        pending: false,
+                        last_queued: Instant::now(),
+                    });
+                }
+                Err(err) => warn!(output = name, %err, "could not mirror the display"),
+            }
+        }
+    }
+
+    /// Show the primary's finished frame, in `dmabuf`, on each mirror that is
+    /// ready for one. A mirror that errors is dropped.
+    fn draw_mirrors(&mut self, dmabuf: &Dmabuf) {
+        if self.mirrors.iter().all(|mirror| mirror.pending) {
+            return;
+        }
+        // The same GPU memory the primary was just drawn into; commands on
+        // this context run in order, so it is complete by the time it is read.
+        let texture = match self.renderer.import_dmabuf(dmabuf, None) {
+            Ok(texture) => texture,
+            Err(err) => {
+                if !self.import_warned {
+                    warn!(%err, "could not read the primary's frame as a texture; mirrors stay blank");
+                    self.import_warned = true;
+                }
+                return;
+            }
+        };
+        let renderer = &mut self.renderer;
+        self.mirrors.retain_mut(|mirror| {
+            if mirror.pending {
+                return true;
+            }
+            match draw_mirror(renderer, mirror, &texture) {
+                Ok(()) => {
+                    mirror.pending = true;
+                    mirror.last_queued = Instant::now();
+                    true
+                }
+                Err(err) => {
+                    warn!(output = mirror.name, %err, "mirror failed; dropping it");
+                    false
+                }
+            }
+        });
+    }
+
+    /// A CRTC that can drive `info` and is not in `taken`: the one it is
+    /// already on if it is on one (to avoid a needless modeset), else any
+    /// that its encoders allow.
     fn crtc_for(
         &self,
         info: &connector::Info,
-        resources: &smithay::reexports::drm::control::ResourceHandles,
+        resources: &ResourceHandles,
+        taken: &[crtc::Handle],
     ) -> Option<crtc::Handle> {
         let encoders: Vec<_> = info
             .current_encoder()
@@ -293,16 +464,34 @@ impl Tty {
             .collect();
         encoders
             .iter()
-            .find_map(|encoder| encoder.crtc())
+            .filter_map(|encoder| encoder.crtc())
+            .find(|crtc| !taken.contains(crtc))
             .or_else(|| {
                 encoders.iter().find_map(|encoder| {
                     resources
                         .filter_crtcs(encoder.possible_crtcs())
-                        .first()
-                        .copied()
+                        .into_iter()
+                        .find(|crtc| !taken.contains(crtc))
                 })
             })
     }
+}
+
+/// Draw the primary's picture into the mirror's next buffer and queue it.
+fn draw_mirror(
+    renderer: &mut GlesRenderer,
+    mirror: &mut Mirror,
+    texture: &GlesTexture,
+) -> Result<(), Box<dyn Error>> {
+    let (mut dmabuf, _age) = mirror.surface.next_buffer()?;
+    let sync = {
+        let mut target = renderer.bind(&mut dmabuf)?;
+        mirror
+            .presenter
+            .present(renderer, &mut target, mirror.size, texture.clone())?
+    };
+    mirror.surface.queue_buffer(Some(sync), None, ())?;
+    Ok(())
 }
 
 /// The DRM device to drive: `FPSDESK_DRM_DEVICE` if set, else the primary GPU.
@@ -358,7 +547,7 @@ pub fn init(
     })?;
 
     handle.insert_source(events.drm, |event, _, state| match event {
-        DrmEvent::VBlank(_) => on_vblank(state),
+        DrmEvent::VBlank(crtc) => on_vblank(state, crtc),
         DrmEvent::Error(err) => {
             // While switched away, errors are expected noise.
             if state.backend.tty().active {
@@ -366,6 +555,13 @@ pub fn init(
             } else {
                 debug!(%err, "DRM error while paused");
             }
+        }
+    })?;
+
+    // A display being plugged in or out changes the DRM device.
+    handle.insert_source(events.udev, |event, _, state| {
+        if let UdevEvent::Changed { device_id } = event {
+            on_device_changed(state, device_id);
         }
     })?;
 
@@ -399,9 +595,35 @@ fn fatal(state: &mut State, message: String) {
     state.loop_signal.stop();
 }
 
-/// The last frame reached the screen: draw the next.
-fn on_vblank(state: &mut State) {
+/// The DRM device changed, which is how a display being plugged in or out
+/// shows up: look at the connectors again.
+fn on_device_changed(state: &mut State, device_id: u64) {
     let tty = state.backend.tty();
+    if device_id != tty.drm.device_id() {
+        return;
+    }
+    // While paused, we do not own the display; resuming looks again.
+    if tty.active {
+        debug!("display configuration changed");
+        tty.sync_mirrors(false);
+    }
+}
+
+/// A page flip on `crtc` completed. For the primary, draw the next frame;
+/// for a mirror, it can take another.
+fn on_vblank(state: &mut State, crtc: crtc::Handle) {
+    let tty = state.backend.tty();
+    if let Some(index) = tty.mirrors.iter().position(|mirror| mirror.crtc == crtc) {
+        let mirror = &mut tty.mirrors[index];
+        match mirror.surface.frame_submitted() {
+            Ok(_) => mirror.pending = false,
+            Err(err) => {
+                warn!(output = mirror.name, %err, "mirror page flip failed; dropping it");
+                tty.mirrors.remove(index);
+            }
+        }
+        return;
+    }
     let Some(output) = tty.output.as_mut() else {
         return;
     };
@@ -443,12 +665,33 @@ fn resume(state: &mut State) {
         // it, or no new frame would be sent while we wait for it.
         let _ = output.surface.frame_submitted();
     }
+    for mirror in &mut tty.mirrors {
+        let _ = mirror.surface.frame_submitted();
+        mirror.pending = false;
+    }
+    // Displays may have come or gone while we were away.
+    tty.sync_mirrors(true);
     render(state);
 }
 
 /// Restart the frame cycle if it has stopped.
 fn check_stall(state: &mut State) {
     let tty = state.backend.tty();
+    if tty.active {
+        // A mirror whose flip never completes (display switched off, say) is
+        // let try again; if that fails too it is dropped.
+        tty.mirrors.retain_mut(|mirror| {
+            if !mirror.pending || mirror.last_queued.elapsed() <= STALL_TIMEOUT {
+                return true;
+            }
+            warn!(
+                output = mirror.name,
+                "mirror page flip did not complete; retrying"
+            );
+            mirror.pending = false;
+            mirror.surface.frame_submitted().is_ok()
+        });
+    }
     let stalled = tty.active
         && tty
             .output
@@ -504,6 +747,8 @@ fn try_render(state: &mut State) -> Result<(), Box<dyn Error>> {
     };
     output.surface.queue_buffer(Some(sync), None, ())?;
     output.last_queued = Instant::now();
+    // The primary is on its way; now the mirrors can have a copy.
+    tty.draw_mirrors(&dmabuf);
 
     frame::finish(state, &wl_output)?;
     state.backend.tty().frame.record(&start);

@@ -24,8 +24,8 @@ is next.
 Still open (none of these block M1-M3):
 
 - **Licence.** Smithay is MIT; pick one before publishing.
-- **Multi-monitor meaning.** One wide view spanning outputs, or one output for
-  the world and others for flat "pinned" windows? Decide in M6.
+- **Multi-monitor meaning.** Mirroring for now (M6). Open: one wide view spanning
+  outputs, or flat "pinned" windows on the others?
 - **Decorations.** Ask clients for server-side decorations and draw a thin 3D
   frame, or let clients draw their own? Decide in M5.
 
@@ -163,15 +163,18 @@ driven frame timing, a session entry so it can be chosen at login, a NixOS
 module. *Done when* it runs from a TTY on this laptop.
 
 The backend part is written (`backend/tty.rs`, `--backend tty`) but untested
-on hardware: single GPU, one output (the internal panel if there is one, at
-its preferred mode, others ignored), `GbmBufferedSurface` driven by vblank,
+on hardware: single GPU, one primary output (the internal panel if there is one, at
+its preferred mode) with every other connected display mirroring its finished
+frame, scaled to fit (the primary's dmabuf imported as a texture; a mirror is
+skipped while its last flip is pending, and dropped if it errors), hot-plug
+through udev change events (an unplugged primary only logs a warning), `GbmBufferedSurface` driven by vblank,
 libinput with tap-to-click, a built-in arrow cursor, Ctrl+Alt+F1..F12 and
 Ctrl+Alt+Backspace always handled first, pause and resume on VT switches, and
 any fatal error exiting cleanly. A dmabuf target is drawn with
 `Transform::Normal` (first row at the top), a window surface with
 `Flipped180`; the screenshot code follows the same rule. Still to do: the
-login-session entry, the NixOS module, monitor hot-plug, a decision on what
-several monitors mean, and output scale chosen automatically (`--scale` for
+login-session entry, the NixOS module, a decision on whether several monitors
+should ever mean more than mirroring, and output scale chosen automatically (`--scale` for
 now).
 
 **M7 - Desktop plumbing.** In rough priority order: clipboard and primary

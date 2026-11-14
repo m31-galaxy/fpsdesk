@@ -23,7 +23,7 @@ use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
-            Color32F, Renderer,
+            Color32F, Renderer, Texture,
             damage::OutputDamageTracker,
             element::{
                 Id, Kind,
@@ -366,6 +366,66 @@ impl Presenter {
         // Age 0: the world changes every frame, so always redraw all of it.
         let result =
             damage_tracker.render_output(renderer, framebuffer, 0, &elements, Color32F::BLACK)?;
+        Ok(result.sync)
+    }
+}
+
+/// Shows a finished frame, such as the primary display's, on another display
+/// of a different size: scaled to fit with its aspect ratio kept, centred,
+/// with black bars where it does not fill.
+pub struct MirrorPresenter {
+    id: Id,
+    damage_tracker: Option<(Size<i32, Physical>, OutputDamageTracker)>,
+}
+
+impl MirrorPresenter {
+    pub fn new() -> Self {
+        Self {
+            id: Id::new(),
+            damage_tracker: None,
+        }
+    }
+
+    /// Draw `image`, whose first row is its top, into `framebuffer`, which is
+    /// `size` pixels and displayed unrotated.
+    pub fn present(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        framebuffer: &mut GlesTarget<'_>,
+        size: Size<i32, Physical>,
+        image: GlesTexture,
+    ) -> Result<SyncPoint, Box<dyn Error>> {
+        if self.damage_tracker.as_ref().is_none_or(|(s, _)| *s != size) {
+            self.damage_tracker =
+                Some((size, OutputDamageTracker::new(size, 1.0, Transform::Normal)));
+        }
+        let (_, damage_tracker) = self.damage_tracker.as_mut().expect("just created");
+
+        let source = image.size();
+        let fit = (size.w as f64 / source.w as f64).min(size.h as f64 / source.h as f64);
+        let width = ((source.w as f64 * fit).round() as i32).clamp(1, size.w);
+        let height = ((source.h as f64 * fit).round() as i32).clamp(1, size.h);
+        let corner = (
+            ((size.w - width) / 2) as f64,
+            ((size.h - height) / 2) as f64,
+        );
+
+        let element = TextureRenderElement::from_static_texture(
+            self.id.clone(),
+            renderer.context_id(),
+            corner,
+            image,
+            1,
+            Transform::Normal,
+            None,
+            None,
+            Some((width, height).into()),
+            None,
+            Kind::Unspecified,
+        );
+        // Age 0: the picture changes every frame, so always redraw all of it.
+        let result =
+            damage_tracker.render_output(renderer, framebuffer, 0, &[element], Color32F::BLACK)?;
         Ok(result.sync)
     }
 }
